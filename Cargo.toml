@@ -1,0 +1,44 @@
+[package]
+name = "kiosk-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "Minimal Wayland kiosk compositor: run one application fullscreen on one output"
+license = "MIT"
+repository = "https://github.com/quinnjr/kiosk-rs"
+keywords = ["wayland", "compositor", "kiosk", "smithay"]
+categories = ["gui"]
+
+[[bin]]
+name = "kiosk"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+rustix = { version = "1.0.7", features = ["fs", "process"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# Test-only: poll(2) on a pidfd and raw signal delivery in child.rs tests.
+libc = "0.2"
+
+[dependencies.smithay]
+version = "0.7.0"
+default-features = false
+features = [
+    "backend_drm",
+    "backend_egl",
+    "backend_gbm",
+    "backend_libinput",
+    "backend_session_libseat",
+    "backend_udev",
+    "desktop",
+    "renderer_gl",
+    "wayland_frontend",
+]
+
+[profile.release]
+lto = "thin"
+strip = true

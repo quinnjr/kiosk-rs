@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Smithay links against these; there is no GPU in CI, which is why the
+      # hardware tests in backend::discovery skip themselves.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libinput-dev \
+            libseat-dev \
+            libgbm-dev \
+            libegl1-mesa-dev \
+            libudev-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libdrm-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt, llvm-tools-preview
+
+      # Prebuilt binary: `cargo install cargo-llvm-cov` compiles from source on
+      # every run and is not covered by the target cache.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      # Coverage last, and non-fatal: it is reported rather than gated, because
+      # the ceiling depends on whether the runner has a GPU. Running it after the
+      # build means a hiccup in the coverage tooling cannot mask a real failure.
+      - name: Coverage
+        continue-on-error: true
+        run: |
+          cargo llvm-cov --summary-only | tee -a "$GITHUB_STEP_SUMMARY"
