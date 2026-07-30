@@ -1,0 +1,76 @@
+@import 'tailwindcss';
+@plugin '@tailwindcss/typography';
+
+/* Dark mode is driven by a `class` on <html> rather than the media query alone,
+   so the toggle can override the OS preference. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --font-sans:
+    ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --font-mono:
+    ui-monospace, 'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Menlo,
+    monospace;
+
+  /* A restrained slate/amber pairing: this is a bare-metal kiosk tool, so the
+     accent reads as a phosphor amber rather than the usual docs-site blue. */
+  --color-accent-50: oklch(0.98 0.02 85);
+  --color-accent-200: oklch(0.9 0.07 85);
+  --color-accent-400: oklch(0.79 0.13 78);
+  --color-accent-500: oklch(0.72 0.15 72);
+  --color-accent-600: oklch(0.62 0.14 68);
+  --color-accent-700: oklch(0.5 0.12 65);
+  --color-accent-900: oklch(0.3 0.08 62);
+}
+
+@layer base {
+  html {
+    scroll-behavior: smooth;
+    /* Anchored headings otherwise land under the sticky header. */
+    scroll-padding-top: 5rem;
+  }
+
+  /* Shiki emits both themes; show the one matching the current mode. */
+  .astro-code,
+  .astro-code span {
+    color: var(--shiki-light);
+    background-color: var(--shiki-light-bg);
+  }
+
+  .dark .astro-code,
+  .dark .astro-code span {
+    color: var(--shiki-dark);
+    background-color: var(--shiki-dark-bg);
+  }
+}
+
+@layer components {
+  /* Wide tables are the norm in these docs — the test matrix has four columns of
+     prose. Let them scroll inside their own box so the page body never does. */
+  .prose :where(table):not(:where([class~='not-prose'] *)) {
+    display: block;
+    width: 100%;
+    overflow-x: auto;
+    border-collapse: collapse;
+    font-size: 0.875rem;
+  }
+
+  .prose :where(th, td):not(:where([class~='not-prose'] *)) {
+    vertical-align: top;
+  }
+
+  .prose :where(pre):not(:where([class~='not-prose'] *)) {
+    overflow-x: auto;
+  }
+
+  /* A heading you can link to, without the anchor shouting on every line. */
+  .heading-anchor {
+    opacity: 0;
+    transition: opacity 150ms;
+  }
+
+  :where(h2, h3, h4):hover > .heading-anchor,
+  .heading-anchor:focus-visible {
+    opacity: 1;
+  }
+}

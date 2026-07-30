@@ -1,0 +1,68 @@
+name: Docs
+
+on:
+  push:
+    branches: [develop]
+    # The site renders README.md and the files in docs/, so a change to any of
+    # them is a content change. Nothing else affects the output.
+    paths:
+      - 'README.md'
+      - 'docs/**'
+      - '.github/workflows/docs.yml'
+  # Manual runs are useful after enabling Pages for the first time, when no
+  # qualifying push has happened yet.
+  workflow_dispatch:
+
+# Pages needs these; the default token is read-only for contents.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# A superseded deploy is not worth finishing, but never cancel one mid-flight —
+# that can leave the Pages deployment in a stuck state.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: docs
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: docs/pnpm-lock.yaml
+
+      # --frozen-lockfile is the default in CI, but state it: a lockfile that
+      # does not match package.json should fail here rather than silently
+      # resolving to something the local build never saw.
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm build
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
