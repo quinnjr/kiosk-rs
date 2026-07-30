@@ -48,3 +48,77 @@ features = [
 [profile.release]
 lto = "thin"
 strip = true
+
+# ---------------------------------------------------------------------------
+# Distribution packaging
+#
+# Both back-ends read the *same* facts the Arch PKGBUILD does: the binary is
+# `kiosk`, the crate is `kiosk-rs`, and the runtime libraries are whatever
+# `readelf -d` reports plus libEGL, which smithay dlopens rather than links. A
+# dependency scanner cannot see a dlopen, so libEGL is added by hand in both
+# lists; without it the compositor exits at startup unable to build a renderer.
+
+[package.metadata.deb]
+maintainer = "Joseph R. Quinn <quinn.josephr@proton.me>"
+copyright = "2026, Joseph R. Quinn"
+license-file = ["LICENSE", "0"]
+# Debian's section for window managers and compositors.
+section = "x11"
+priority = "optional"
+extended-description = """\
+kiosk-rs runs one Wayland application fullscreen on one output and exits when \
+that application exits. It is not a window manager: there is no configuration \
+file, no compositor UI, and no way for the client to leave the kiosk geometry. \
+Requires a DRM/KMS device and a session provider (seatd or logind); there is no \
+nested backend, so it cannot run inside another compositor."""
+# `$auto` runs dpkg-shlibdeps against the built binary, which yields versioned
+# dependencies from the shlibs files rather than a hand-maintained list. It
+# resolves on the Debian-family runner that builds the package, not on the
+# maintainer's machine -- see the packaging notes in the README. libegl1 is
+# appended because dpkg-shlibdeps reads DT_NEEDED and libEGL is dlopened.
+depends = "$auto, libegl1"
+assets = [
+  ["target/release/kiosk", "usr/bin/", "755"],
+  ["README.md", "usr/share/doc/kiosk-rs/README.md", "644"],
+  ["docs/manual-test-matrix.md", "usr/share/doc/kiosk-rs/manual-test-matrix.md", "644"],
+]
+
+[package.metadata.generate-rpm]
+# Soname requires rather than package names: `libgbm.so.1()(64bit)` resolves on
+# Fedora, RHEL, and openSUSE alike, whereas the package providing it is named
+# differently on each.
+#
+# auto-req is off, and the requires below are the binary's DT_NEEDED entries
+# written out by hand. The alternatives were both worse:
+#
+#   "builtin"       uses ldd, which walks the *transitive* closure. That produced
+#                   requires on liblua5.4.so.5.4, libwacom.so.9, libmtdev.so.1
+#                   and nine others -- libinput's and mesa's private dependencies,
+#                   not ours. Worse than merely noisy: Fedora ships lua as
+#                   liblua-5.4.so, so an RPM demanding liblua5.4.so.5.4 will not
+#                   install there at all.
+#   "find-requires" is correct (rpm's own script reads DT_NEEDED) but needs
+#                   rpm-build present wherever the package is produced, which
+#                   makes the output depend on the builder's tooling.
+#
+# Keep this list in step with `readelf -d target/release/kiosk`. It is short and
+# changes only when a dependency starts linking something new.
+auto-req = "disabled"
+assets = [
+  { source = "target/release/kiosk", dest = "/usr/bin/kiosk", mode = "755" },
+  { source = "LICENSE", dest = "/usr/share/licenses/kiosk-rs/LICENSE", mode = "644", doc = true },
+  { source = "README.md", dest = "/usr/share/doc/kiosk-rs/README.md", mode = "644", doc = true },
+  { source = "docs/manual-test-matrix.md", dest = "/usr/share/doc/kiosk-rs/manual-test-matrix.md", mode = "644", doc = true },
+]
+
+[package.metadata.generate-rpm.requires]
+# DT_NEEDED, verbatim.
+"libgbm.so.1()(64bit)" = "*"
+"libseat.so.1()(64bit)" = "*"
+"libudev.so.1()(64bit)" = "*"
+"libinput.so.10()(64bit)" = "*"
+"libxkbcommon.so.0()(64bit)" = "*"
+"libgcc_s.so.1()(64bit)" = "*"
+"libc.so.6()(64bit)" = "*"
+# Not in DT_NEEDED: smithay dlopens it. See the note at the top of this section.
+"libEGL.so.1()(64bit)" = "*"
