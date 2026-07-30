@@ -207,14 +207,15 @@ Discovery therefore enumerates *all* DRM devices before applying any selection p
 ```rust
 struct OutputCandidate {
     device: PathBuf,                 // /dev/dri/card1
+    device_id: u64,                  // dev_t, captured while the node still exists
     connector: connector::Handle,
     name: String,                    // "DP-1"
     connected: bool,
     preferred_mode: Option<Mode>,
 }
 
-fn enumerate(
-    session: &mut LibSeatSession,
+fn enumerate<S: Session>(
+    session: &mut S,
     udev: &UdevBackend,
 ) -> Result<Vec<OutputCandidate>>;
 
@@ -293,8 +294,13 @@ All window policy lives in `handlers/xdg_shell.rs` and is stated exhaustively:
   takes focus. No focus cycling.
 - **Toplevel destroyed** — pop, focus the new top. An empty stack does **not** exit. kiosk-rs's
   lifetime is the child process's, full stop: one shutdown trigger, no interaction between two.
-- **Client requests** `unset_fullscreen`, `move`, `resize` — acknowledged with a configure that keeps
-  the surface fullscreen. The client cannot escape the kiosk geometry.
+- **Client requests** `unset_fullscreen`, `maximize`, `unmaximize` — acknowledged with a configure
+  that restates fullscreen. `move`, `resize`, and `minimize` are ignored: the protocol requires no
+  reply to any of them, and the geometry is fixed regardless. Either way the client cannot escape the
+  kiosk geometry.
+- **Toplevel count** — capped at 32. A client that exceeds it is sent a protocol
+  error and disconnected, so it cannot exhaust memory or stall the per-frame window
+  walk. This is distinct from refusing a second toplevel, which would break dialogs.
 - **Popups** — honoured via `PopupManager`, with the positioner constrained to the output rect.
 
 Rejecting extra toplevels was considered and rejected: a GTK dialog *is* an `xdg_toplevel`, so
@@ -350,8 +356,22 @@ startup failure silent.
 2. **Runtime recoverable** — DRM commit returning `EBUSY`/`EACCES` after losing master, client
    protocol errors (Smithay disconnects that client), buffer import failure. Logged at `warn`; the
    frame is dropped and the loop continues.
-3. **Runtime fatal** — GPU device removed, event loop poll error. Logged at `error`, followed by
-   clean teardown and a nonzero exit.
+3. **Runtime fatal** — GPU device removed, a `DrmEvent::Error` (page-flip completions
+   were lost, so the vblank stream can no longer be trusted), a failed session
+   resume, and event loop poll errors. Logged at `error`, followed by clean teardown
+   and a nonzero exit.
+
+   GPU removal is matched by the card's `dev_t`, captured at enumeration. By the time
+   `UdevEvent::Removed` arrives the device is gone from sysfs, so resolving a `dev_t`
+   back to a path fails — a path comparison would never fire.
+
+A dropped frame is tier 2, but "drop it and continue" requires a wake-up: with no
+flip queued there is no vblank, so the caller must release the clients and arm a
+one-shot retry timer (upstream's `DrmCompositor::queue_frame` documents this as the
+caller's responsibility). A frame that keeps dropping escalates to tier 3 after 60
+consecutive failures — about a second at the 16ms retry interval. Retrying forever
+would trade a visible freeze for an invisible one: the screen stuck either way,
+while the retry loop fills a log that has no rotation.
 
 ### 8.1 Exit codes
 
@@ -369,10 +389,21 @@ kiosk-rs is transparent in scripts:
 A recorded child status outranks a teardown error: a fatal error during shutdown
 must not rewrite a real `exit 42` into the ambiguous `1`.
 
-### 8.2 Panic hook
+### 8.2 Panic containment
 
 A panic during render would otherwise leave the TTY in graphics mode with no input — an
-unrecoverable machine. The hook restores the VT to text mode through the session before unwinding.
+unrecoverable machine.
+
+The event loop run is therefore wrapped in `catch_unwind` rather than guarded by a
+panic hook. A hook would have to be `Send + Sync` and `LibSeatSession` is neither,
+but the better reason is that catching converts the panic into an ordinary error
+return, so the normal teardown runs: dropping the `DrmCompositor` restores the
+original CRTC configuration and dropping the session hands the VT back. A hook that
+switched VTs itself would fight that same teardown. The VT is therefore restored
+*after* the unwind, by `Drop`, not before it.
+
+The first frame is painted inside the same `catch_unwind`, since it is the process's
+first GPU submission and the most likely place to panic.
 
 ### 8.3 Teardown
 

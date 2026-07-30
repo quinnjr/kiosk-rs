@@ -30,10 +30,10 @@ const TERMINATE_GRACE: Duration = Duration::from_millis(2000);
 
 /// Exit status used when the child cannot be reaped at all.
 ///
-/// Deliberately distinct from any status a child can produce (0-255 for a normal
-/// exit, 128+n for a signal), so a script can tell "kiosk could not determine the
-/// child's fate" apart from "the child exited 1". 125 follows the convention used
-/// by `env` and `timeout` for "the tool itself failed".
+/// 125 is the convention `env` and `timeout` use for "the tool itself failed". It
+/// cannot be distinct from *every* status a child can produce — a child may exit 125
+/// too — but it is distinct from the likely ones (0, 1, and 128+n), which is enough
+/// for a script to tell this apart from an ordinary failure.
 const REAP_FAILURE_STATUS: i32 = 125;
 
 /// A spawned child and the pidfd that reports its exit.

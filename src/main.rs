@@ -157,7 +157,7 @@ fn init_logging(cli: &Cli) -> Result<()> {
 fn filter_directive(rust_log: Option<&str>, verbose: u8) -> String {
     match rust_log {
         Some(value) if !value.trim().is_empty() => value.to_string(),
-        _ => cli::log_filter(verbose).to_string(),
+        _ => cli::log_filter(verbose),
     }
 }
 

@@ -117,20 +117,48 @@ fn list_outputs_refuses_a_command_rather_than_silently_discarding_it() {
 
 /// The filter directives are useless if they name a target no event carries, and
 /// that failure is invisible: levels appear to work via the bare global default.
+///
+/// This must be observed through the `--log-file` sink, which only `tracing` can
+/// write. Asserting on stderr proves nothing, because the fatal `eprintln!` is
+/// unconditional and emits the same `kiosk:` prefix whatever the filter says — an
+/// earlier version of this test did exactly that and passed with the bug present.
+///
+/// Scope: this pins that our events reach a `tracing` sink under a target-scoped
+/// filter, and are suppressed under a non-matching one. It does *not* pin that
+/// `log_filter`'s directives name the right target — `EnvFilter` matches targets by
+/// prefix, so a hardcoded `kiosk=` filter would still match a `kiosk_rs` crate root.
+/// That invariant lives in `cli.rs::the_filter_target_matches_this_crates_real_module_path`.
 #[test]
-fn our_own_log_events_are_actually_matched_by_the_v_filter() {
-    // A startup failure logs at error. With a filter that matches only our target,
-    // the line must still appear — if the target were wrong, output would be empty
-    // apart from the unconditional eprintln.
-    let out = Command::new(env!("CARGO_BIN_EXE_kiosk"))
-        .args(["--output", "BOGUS-9", "--", "/bin/true"])
-        .env("RUST_LOG", "kiosk=trace")
-        .output()
-        .expect("failed to run the kiosk binary");
-    let err = String::from_utf8_lossy(&out.stderr);
+fn our_own_log_events_reach_the_tracing_sink_under_a_target_filter() {
+    fn log_with_filter(filter: &str, suffix: &str) -> String {
+        let path =
+            std::env::temp_dir().join(format!("kiosk-filter-{}-{suffix}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        Command::new(env!("CARGO_BIN_EXE_kiosk"))
+            .args(["--log-file", path.to_str().unwrap()])
+            .args(["--output", "BOGUS-9", "--", "/bin/true"])
+            .env("RUST_LOG", filter)
+            .output()
+            .expect("failed to run the kiosk binary");
+        let body = std::fs::read_to_string(&path).unwrap_or_default();
+        let _ = std::fs::remove_file(&path);
+        body
+    }
+
+    // Matching our real target: the subscriber must write the startup error.
+    let matched = log_with_filter("kiosk=error", "match");
     assert!(
-        err.contains("kiosk:"),
-        "expected a diagnostic on stderr, got: {err}"
+        matched.contains("ERROR"),
+        "our events did not reach the tracing sink under a filter naming our \
+         target: {matched:?}"
+    );
+
+    // Differential: a filter naming nothing must produce an empty sink. Without
+    // this half, the assertion above could be satisfied by any always-on writer.
+    let unmatched = log_with_filter("no_such_target=error", "nomatch");
+    assert!(
+        unmatched.trim().is_empty(),
+        "a filter matching nothing still wrote to the log sink: {unmatched:?}"
     );
 }
 
