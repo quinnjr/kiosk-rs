@@ -1,7 +1,7 @@
 # kiosk-rs — Design
 
 **Date:** 2026-07-29
-**Status:** Approved (design); not yet implemented
+**Status:** Implemented; this document is the design record for v0.1
 **Crate:** `kiosk-rs` · **Binary:** `kiosk`
 
 ## 1. Purpose
@@ -47,7 +47,7 @@ It is not a window manager, has no configuration file, and has no compositor UI.
 Built on [Smithay](https://github.com/Smithay/smithay), a pure-Rust compositor toolkit. Smithay
 supplies Wayland protocol handling (`wayland-server`), the `calloop` event loop, DRM/GBM/libinput/udev
 backends, an EGL/GLES2 renderer, and `xdg-shell` helpers. The cage-equivalent feature set lands in
-roughly 1500 lines of Rust with no hand-written FFI.
+roughly 4800 lines of Rust including tests, with no hand-written FFI.
 
 Alternatives considered and rejected:
 
@@ -61,15 +61,15 @@ Alternatives considered and rejected:
 
 | Crate | Purpose |
 | --- | --- |
-| `smithay` | Protocol, backends, renderer. Features: `backend_drm`, `backend_libinput`, `backend_session_libseat`, `backend_udev`, `backend_egl`, `renderer_gl`, `wayland_frontend` |
+| `smithay` | Protocol, backends, renderer. Features: `backend_drm`, `backend_egl`, `backend_gbm`, `backend_libinput`, `backend_session_libseat`, `backend_udev`, `desktop`, `renderer_gl`, `wayland_frontend` |
 | `calloop` | Event loop (re-exported by Smithay; pinned to the same version) |
-| `rustix` | `pidfd_open`, `kill`, `setsid`, `poll` |
+| `rustix` | `pidfd_open`, `kill`, `setsid`, `poll`, and the log sink's `fstat`/`fchmod` |
 | `clap` | Argument parsing (derive) |
 | `tracing`, `tracing-subscriber` | Logging; `env-filter` feature |
 | `anyhow` | Error context chains |
-| `libc` | **dev-dependency only** — `poll(2)` and raw signals in tests |
+| `libc` | `pthread_sigmask` in the child's `pre_exec` (rustix exposes no stable sigmask call); also `poll(2)` and raw signals in tests |
 
-System libraries: `libinput`, `libseat`, `libgbm`, `libEGL`.
+System libraries: `libinput`, `libseat`, `libgbm`, `libEGL`, `libudev`, `libxkbcommon`, `libdrm`.
 
 ## 4. Architecture
 
@@ -101,6 +101,9 @@ Single-threaded `calloop::EventLoop<Kiosk>` with these sources:
 | `LibinputInputBackend` | key / pointer / touch event | forward to `Seat` → focused surface |
 | `Generic<pidfd>` | child process exits | `waitpid`, break loop, propagate status |
 | `LibSeatSession` notifier | session pause / activate | suspend or resume backend |
+| `Signals` (`SIGTERM`, `SIGINT`) | supervisor stop | `shutdown(128 + signum)` |
+| `UdevBackend` | device added / removed | a `Removed` matching the chosen card's `dev_t` → tier-3 shutdown |
+| `Timer` (one-shot) | ~16ms after a dropped frame | re-enter `render` (no flip queued ⇒ no vblank to wake us) |
 
 The child watcher uses `pidfd_open(2)` rather than a `SIGCHLD` handler. A pidfd is pollable, so child
 death becomes an ordinary calloop event with no async-signal-safety constraints and no race between
@@ -113,16 +116,23 @@ Order matters and is easy to get wrong:
 1. Parse CLI; initialise `tracing` subscriber (before any Smithay call, so Smithay's own spans are
    captured).
 2. Open the log file if `--log-file` was given. Failure here is fatal and reported to stderr.
-3. Create `LibSeatSession`.
-4. Create `Display`, bind the Wayland socket, register globals.
-5. Enumerate DRM devices and connectors (§5).
-6. Select the output (§5). `--list-outputs` prints and exits here, having never touched EGL.
-7. Build `GbmDevice`, `EGLDisplay`/`EGLContext`, `GlesRenderer`, and `DrmCompositor` for the chosen
-   card only.
-8. Advertise the `wl_output` global from the connector's preferred mode.
-9. Install panic containment (§8.2).
-10. Spawn the child with `WAYLAND_DISPLAY` set; open its pidfd and register the source.
-11. Run the loop.
+3. Create `LibSeatSession`, then the `UdevBackend` for the seat.
+4. Enumerate DRM devices and connectors (§5).
+5. Select the output (§5). `--list-outputs` prints and exits here, having never touched EGL.
+6. Construct the `Signals` source — **before** any EGL/GLES initialisation, because constructing it
+   blocks the signals with a per-thread mask and Mesa's worker threads must inherit that block.
+   It is *registered* last (step 12) so that it is also dropped last: dropping it unblocks the
+   signals, which must not happen before libseat has closed the seat and restored the console.
+7. Create `Display`, bind the Wayland socket, and register the socket and display sources.
+8. Build `GbmDevice`, `EGLDisplay`/`EGLContext`, `GlesRenderer`, and `DrmCompositor` for the chosen
+   card only; register the DRM and udev sources and the session notifier.
+9. Register the protocol globals, including the `wl_output` built from the connector's preferred
+   mode.
+10. Create the seat and input sources.
+11. Install panic containment (§8.2).
+12. Spawn the child with `WAYLAND_DISPLAY` set; open its pidfd and register the source; register the
+    `Signals` source from step 6 last of all.
+13. Run the loop.
 
 The socket must exist before the child runs, and the output must be advertised before the child asks
 for a fullscreen size.
@@ -249,7 +259,7 @@ to its bare global level.
 | `-vv` | `kiosk=trace,debug` |
 | `-vvv` | `trace` — includes Smithay's protocol-level spans and DRM atomic-commit detail |
 
-If `RUST_LOG` is set it wins outright and the `-v` count is ignored — the standard `tracing`
+If `RUST_LOG` is set to a non-empty value it wins outright and the `-v` count is ignored — the standard `tracing`
 convention, and the escape hatch for tracing one module without drowning in the rest.
 
 Smithay instruments itself with `tracing`, so `-vvv` yields per-request Wayland protocol logging for
@@ -262,7 +272,15 @@ Verbose logging on the real target is write-only without a file destination.
 
 - `--log-file <PATH>` absent → stderr.
 - Present → opened in **append** mode, before graphics mode. A crash-looping kiosk keeps the history
-  of every attempt, which is the case logs are most needed for.
+  of every attempt, which is the case logs are most needed for. The opened descriptor is then checked
+  and tightened: it must be a regular file, with exactly one hard link, owned by our own euid, and
+  `fchmod` forces `0600`. The ownership check is what makes the others meaningful — `fchmod` does not
+  change ownership, so the owner of a file we do not own could simply relax it again. Opened
+  `O_NOFOLLOW|O_NONBLOCK` so neither a pre-planted symlink nor a FIFO (which would block the open
+  indefinitely) can subvert it.
+  `mode(0o600)` alone applies only when the open creates the file, and `O_NOFOLLOW` rejects a symlink
+  but not a pre-created file — so without these checks a lesser-privileged user could pre-create the
+  path and have root append a `-vvv` keystroke log for them.
 - Parent directories are not created. A missing directory or unwritable path is a startup error,
   reported to stderr while stderr is still visible.
 - ANSI colours are disabled when the sink is a file.
@@ -298,9 +316,15 @@ All window policy lives in `handlers/xdg_shell.rs` and is stated exhaustively:
   that restates fullscreen. `move`, `resize`, and `minimize` are ignored: the protocol requires no
   reply to any of them, and the geometry is fixed regardless. Either way the client cannot escape the
   kiosk geometry.
-- **Toplevel count** — capped at 32. A client that exceeds it is sent a protocol
-  error and disconnected, so it cannot exhaust memory or stall the per-frame window
-  walk. This is distinct from refusing a second toplevel, which would break dialogs.
+- **Toplevel count** — capped at 32, compositor-wide. The client requesting one
+  beyond the limit is sent a protocol error and disconnected, so no client can
+  exhaust memory or stall the per-frame window walk. Distinct from refusing a second
+  toplevel, which would break dialogs.
+- **Popup count and depth** — capped at 64 popups and 8 chain levels. Depth is the
+  sharper limit: every operation on Smithay's popup tree recurses once per level, so
+  an unbounded chain reaches a stack overflow, and an overflow aborts rather than
+  unwinds — bypassing the `catch_unwind` in §8.2 and skipping the CRTC and VT
+  restore entirely.
 - **Popups** — honoured via `PopupManager`, with the positioner constrained to the output rect.
 
 Rejecting extra toplevels was considered and rejected: a GTK dialog *is* an `xdg_toplevel`, so
@@ -349,6 +373,12 @@ A fatal error is always written to stderr with `eprintln!`, independently of the
 `tracing` subscriber: a filter that matches nothing must not be able to make a
 startup failure silent.
 
+`SIGTERM` and `SIGINT` are handled as event-loop sources rather than left to the
+default disposition. A supervisor stop is the exit path a deployment uses most, and
+without a handler it would be the only one with no teardown at all — no unwind, so
+no `Drop` to restore the CRTC and VT, and no chance to signal the child, which is
+`setsid`-detached with its streams on `/dev/null` and would survive indefinitely.
+
 1. **Startup** — no DRM device, connector unknown or disconnected, EGL failure, child binary missing,
    socket bind failure, unwritable log file. All fail before graphics mode, print an `anyhow` context
    chain to stderr, and exit 1. Nothing here is recoverable, and a half-initialised compositor is
@@ -373,6 +403,13 @@ consecutive failures — about a second at the 16ms retry interval. Retrying for
 would trade a visible freeze for an invisible one: the screen stuck either way,
 while the retry loop fills a log that has no rotation.
 
+Page-flip *bookkeeping* failures (a `frame_submitted` error on vblank) escalate to
+tier 3 on the same budget but through a **separate counter**. They cannot share the
+dropped-frame budget: the render that follows a failed `frame_submitted` normally
+succeeds and resets it, so a shared counter would make the escalation unreachable in
+exactly the case it exists for — a display failing its bookkeeping every vblank,
+warning 60 times a second into that unrotated log forever.
+
 ### 8.1 Exit codes
 
 kiosk-rs is transparent in scripts:
@@ -381,6 +418,7 @@ kiosk-rs is transparent in scripts:
 | --- | --- |
 | Child exited normally | the child's code, verbatim |
 | Child died by signal | `128 + signum` (shell convention) |
+| Supervisor stop (`SIGTERM`/`SIGINT` to the compositor) | `128 + signum`; the child is sent `SIGTERM` and waited for, bounded at 2s |
 | Exited via `--exit-key` | 0 (the child is sent `SIGTERM` and waited for, bounded at 2s, then left to init) |
 | kiosk-rs startup failure | 1 |
 | kiosk-rs runtime fatal | 1 |
@@ -421,7 +459,8 @@ accordingly.
 - `backend/discovery.rs::select` — all four branches: name matches, name unknown, name known but
   disconnected, nothing connected.
 - Connector-name formatting.
-- `--exit-key` binding parsing: valid bindings, unknown modifier, unknown keysym, missing keysym.
+- `--exit-key` binding parsing: valid bindings, unknown modifier, unknown keysym, empty component (a
+  "missing keysym" is not separately representable — `"Ctrl+"` is an empty component).
 - Exit-code mapping, including the `128 + signum` path.
 
 **Smoke test:** `--list-outputs` on real hardware. It never touches EGL, so it runs over SSH and
@@ -445,4 +484,7 @@ validates enumeration independently of rendering.
 
 Without this matrix, "tested" would mean nothing for this project.
 
-**CI:** `cargo clippy -- -D warnings`, `cargo fmt --check`, and the unit tests. No GPU in CI.
+**CI:** `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --locked`,
+`cargo build --release --locked`, a non-gating coverage report, and a separate MSRV job pinned to the
+`rust-version` in `Cargo.toml`. No GPU in CI, so the DRM tests early-return there; `KIOSK_REQUIRE_DRM=1` turns
+that skip into a failure on real hardware (see `docs/manual-test-matrix.md`).

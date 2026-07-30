@@ -15,14 +15,20 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"
+# Same version smithay pins, so the crates unify; we only add the `signals`
+# feature so a supervisor stop can be handled as an event rather than killing us
+# with no teardown.
+calloop = { version = "0.14.0", features = ["signals"] }
 clap = { version = "4.5", features = ["derive"] }
+# `pthread_sigmask` in the child's `pre_exec`. rustix exposes a sigmask call only as
+# `runtime::kernel_sigprocmask`, which is `doc(hidden)`, explicitly unstable, and
+# gated behind a `runtime` feature and the linux_raw backend — not something to
+# depend on for a signal reset that has to be exactly right. Also used by the tests
+# for poll(2) and raw signal delivery.
+libc = "0.2"
 rustix = { version = "1.0.7", features = ["fs", "process"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-[dev-dependencies]
-# Test-only: poll(2) on a pidfd and raw signal delivery in child.rs tests.
-libc = "0.2"
 
 [dependencies.smithay]
 version = "0.7.0"

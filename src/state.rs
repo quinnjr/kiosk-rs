@@ -9,7 +9,6 @@
 //! stack at the origin.
 
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::time::Instant;
 
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
@@ -65,8 +64,7 @@ pub struct Kiosk {
     pub cursor_status: CursorImageStatus,
     pub pointer_location: Point<f64, Logical>,
     pub exit_key: Option<Binding>,
-    /// Keys the client currently believes are held. Needed because the release of
-    /// a `Ctrl+Alt+F<n>` chord is delivered to the incoming VT, not to us.
+    /// Keys the client currently believes are held; see `Kiosk::release_all_keys`.
     pub pressed_keys: HashSet<Keycode>,
     /// The most recent *keyboard* event timestamp, in libinput's timebase. Pointer
     /// and touch events do not update it — only key events need it, so that a
@@ -93,11 +91,20 @@ pub struct Kiosk {
     /// permanently-failing display from tier 2 to tier 3 instead of retrying
     /// forever.
     pub consecutive_drops: u32,
+    /// Page-flip bookkeeping failures in a row. Deliberately *not* shared with
+    /// [`Self::consecutive_drops`] — see `Kiosk::on_vblank` in [`crate::backend::drm`].
+    pub submit_failures: u32,
+    /// Popups currently tracked, counted exactly rather than derived.
+    ///
+    /// Deriving it from `windows` (by summing `PopupManager::popups_for_surface` over
+    /// the toplevels) looked equivalent and was not: `get_popup` accepts any
+    /// `xdg_surface` as a parent with no role check, so a client can root a popup
+    /// tree on a surface that never becomes a toplevel. That tree is invisible to a
+    /// `windows`-derived count, which made the cap bypassable. Counting on track and
+    /// untrack is exact by construction and independent of how Smithay files popups.
+    pub popup_count: usize,
     /// Set when the compositor should shut down, and with what status.
     pub exit_code: Option<i32>,
-    /// True once the child has exited and been reaped. Distinguishes "the child
-    /// ended, so we are ending" from "we are ending, so the child must be told".
-    pub child_reaped: bool,
 }
 
 impl Kiosk {
@@ -113,7 +120,7 @@ impl Kiosk {
     }
 
     /// The focused window, i.e. the top of the stack.
-    pub fn top_window(&self) -> Option<&Window> {
+    fn top_window(&self) -> Option<&Window> {
         self.windows.last()
     }
 
@@ -248,7 +255,7 @@ impl Kiosk {
     /// Record which output each surface was scanned out on, so
     /// [`Self::send_frames`] can throttle correctly.
     pub fn update_scanout_state(&mut self, states: &RenderElementStates) {
-        // One of the two read paths named in `drop_dead_cursor`'s doc. Guarding
+        // One of the read paths named in `drop_dead_cursor`'s doc. Guarding
         // here rather than relying on `render_elements` having run first means the
         // safety does not depend on call ordering inside `render`.
         self.drop_dead_cursor();
@@ -305,7 +312,8 @@ impl Kiosk {
     /// Drop a dead cursor surface.
     ///
     /// `cursor_status` holds a surface the client owns and may destroy at any
-    /// time. Every read path (`with_states`, `with_surfaces_surface_tree`) unwraps
+    /// time. Every path that walks the cursor's surface tree (`with_states`,
+    /// `with_surfaces_surface_tree`, `send_frames_surface_tree`) unwraps
     /// the surface's user data, which panics on a destroyed resource — so a client
     /// could kill the compositor by destroying its cursor surface while the
     /// pointer is inside its window.
@@ -346,7 +354,7 @@ pub(crate) fn size_of(output: &Output) -> Size<i32, Logical> {
 }
 
 /// The output rect in logical coordinates, anchored at the origin.
-pub(crate) fn rect_of(output: &Output) -> Rectangle<i32, Logical> {
+fn rect_of(output: &Output) -> Rectangle<i32, Logical> {
     Rectangle::from_size(size_of(output))
 }
 
@@ -364,12 +372,6 @@ impl ClientData for ClientState {
 
     fn disconnected(&self, client_id: ClientId, reason: DisconnectReason) {
         tracing::debug!(?client_id, ?reason, "client disconnected");
-    }
-}
-
-impl ClientState {
-    pub fn new_arc() -> Arc<Self> {
-        Arc::new(Self::default())
     }
 }
 

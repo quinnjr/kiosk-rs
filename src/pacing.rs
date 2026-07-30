@@ -115,13 +115,6 @@ impl FramePacer {
         self.pending_flip = true;
     }
 
-    /// A render produced no visible change, so no flip was queued.
-    ///
-    /// Deliberately does *not* restore the damage flag. There is genuinely
-    /// nothing to draw, and setting it would spin: poll would keep returning
-    /// `Render` for a frame that keeps coming out empty. The next commit sets it.
-    pub fn frame_empty(&mut self) {}
-
     /// Rendering or queueing failed. The frame is still owed, so restore damage
     /// and clear any flip we thought we had.
     pub fn frame_failed(&mut self) {
@@ -296,8 +289,9 @@ mod tests {
                         next.frame_queued();
                         next_rendering = false;
                     }
+                    // No pacer call: an empty frame queues no flip and deliberately
+                    // does not re-arm damage, so it leaves pacer state untouched.
                     Ev::Empty => {
-                        next.frame_empty();
                         next_rendering = false;
                     }
                     Ev::Failed => {
@@ -321,7 +315,6 @@ mod tests {
     fn a_clean_pacer_does_not_render() {
         let mut pacer = FramePacer::new();
         pacer.begin_render();
-        pacer.frame_empty();
         assert_eq!(pacer.poll(), RenderDecision::Clean);
     }
 
@@ -329,7 +322,6 @@ mod tests {
     fn damage_makes_a_clean_pacer_render_again() {
         let mut pacer = FramePacer::new();
         pacer.begin_render();
-        pacer.frame_empty();
         assert_eq!(pacer.poll(), RenderDecision::Clean);
 
         pacer.damage();
@@ -405,7 +397,6 @@ mod tests {
     fn an_empty_frame_does_not_busy_loop() {
         let mut pacer = FramePacer::new();
         pacer.begin_render();
-        pacer.frame_empty();
 
         // No flip was queued, so no vblank is coming; if this returned Render the
         // compositor would render empty frames forever.
@@ -482,7 +473,6 @@ mod tests {
     fn resuming_from_clean_still_repaints() {
         let mut pacer = FramePacer::new();
         pacer.begin_render();
-        pacer.frame_empty();
         assert_eq!(pacer.poll(), RenderDecision::Clean);
 
         pacer.pause();

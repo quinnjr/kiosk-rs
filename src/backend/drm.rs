@@ -1,8 +1,10 @@
 //! The DRM/KMS backend: session, GBM, renderer, and frame submission.
 //!
-//! This is the only module that touches the GPU. It owns the chosen card and
-//! nothing else — [`super::discovery`] has already decided which card and
-//! connector to use.
+//! This is the only module that *sets up* the GPU: it owns the chosen card, the
+//! renderer, and frame submission. [`super::discovery`] has already decided which
+//! card and connector to use. Rendering *with* that renderer happens elsewhere —
+//! [`crate::state::Kiosk::render_elements`] and [`crate::handlers`] both take
+//! `&mut backend.renderer`.
 //!
 //! # Frame pacing
 //!
@@ -58,6 +60,24 @@ const RETRY_INTERVAL: Duration = Duration::from_millis(16);
 /// retry loop wrote thousands of warnings a minute into a log that has no rotation.
 /// Exiting lets a supervisor restart us, which is the tier-3 contract.
 const MAX_CONSECUTIVE_DROPS: u32 = 60;
+
+/// Record a frame outcome against a drop budget; returns true when it is spent.
+///
+/// Every outcome goes through here rather than the success paths clearing the
+/// counter inline — including the VT-resume reset in `main`. That is what makes the
+/// reset rule testable: "60 consecutive"
+/// only means anything if a success actually zeroes the budget, and a test cannot
+/// observe that if the reset lives in `render`, which needs a live `DrmCompositor`.
+/// Free function for the same reason — the off-by-one and the reset are the parts a
+/// future change is most likely to get wrong, and neither needs a GPU to check.
+pub(crate) fn note_frame(drops: &mut u32, succeeded: bool) -> bool {
+    if succeeded {
+        *drops = 0;
+        return false;
+    }
+    *drops += 1;
+    *drops >= MAX_CONSECUTIVE_DROPS
+}
 
 pub struct DrmBackend {
     pub drm: DrmDevice,
@@ -190,22 +210,22 @@ impl DrmBackend {
         self.drm
             .activate(true)
             .context("failed to reacquire DRM master")?;
+
+        // Drop the flip the kernel will never report. `DrmCompositor` keeps its own
+        // copy of "a flip is in flight" in `pending_frame`, and neither `activate`
+        // nor `reset_state` clears it — only `frame_submitted` does. Leave it set and
+        // the next `queue_frame` takes its `if pending_frame.is_none()` branch: it
+        // enqueues, returns `Ok`, and never commits. The pacer would then believe a
+        // flip is in flight, no vblank would ever arrive, and the screen would stay
+        // frozen for good. `queued_frame` is always `None` here, so this cannot
+        // submit anything.
+        let _ = self.compositor.frame_submitted();
         self.compositor
             .reset_state()
             .context("failed to reset scanout state")?;
         self.compositor.reset_buffers();
 
         Ok(())
-    }
-
-    /// True while this backend owns the screen.
-    pub fn is_active(&self) -> bool {
-        self.pacer.is_active()
-    }
-
-    /// Mark the composited image stale.
-    pub fn damage(&mut self) {
-        self.pacer.damage();
     }
 }
 
@@ -254,19 +274,22 @@ impl Kiosk {
         if frame.is_empty {
             // An empty frame is a success, not a drop: the render worked and there
             // was simply nothing new to show.
-            self.consecutive_drops = 0;
-            // Nothing changed, so there is no flip to queue and therefore no
-            // vblank coming. Clients still waiting on a frame callback must be
-            // released here, or a client that commits without visible damage
-            // waits forever and never commits again — a permanent freeze.
-            self.backend.pacer.frame_empty();
+            note_frame(&mut self.consecutive_drops, true);
+            // No pacer transition: an empty frame queues no flip, and damage is
+            // deliberately left clear. Re-arming it would spin — `poll` would keep
+            // returning `Render` for a frame that keeps coming out empty. The next
+            // commit sets it.
+            //
+            // Clients still waiting on a frame callback must be released here
+            // though, or a client that commits without visible damage waits forever
+            // and never commits again — a permanent freeze.
             self.send_frames();
             return;
         }
 
         match self.backend.compositor.queue_frame(()) {
             Ok(()) => {
-                self.consecutive_drops = 0;
+                note_frame(&mut self.consecutive_drops, true);
                 self.backend.pacer.frame_queued();
             }
             Err(err) => {
@@ -287,8 +310,7 @@ impl Kiosk {
     fn recover_from_dropped_frame(&mut self) {
         self.send_frames();
 
-        self.consecutive_drops += 1;
-        if self.consecutive_drops >= MAX_CONSECUTIVE_DROPS {
+        if note_frame(&mut self.consecutive_drops, false) {
             tracing::error!(
                 drops = self.consecutive_drops,
                 "frames have failed continuously; the display is unusable"
@@ -324,9 +346,29 @@ impl Kiosk {
     pub fn on_vblank(&mut self) {
         self.backend.pacer.flip_completed();
 
-        if let Err(err) = self.backend.compositor.frame_submitted() {
-            tracing::warn!(?err, "failed to mark frame submitted");
-            self.backend.pacer.frame_failed();
+        // Submission bookkeeping gets its own budget. It cannot share
+        // `consecutive_drops`: the `render()` below succeeds on each of these cycles
+        // and resets that counter, so the escalation would be unreachable in exactly
+        // the scenario it exists for — a display whose bookkeeping fails every
+        // vblank, warning 60 times a second forever into a log with no rotation.
+        // Separate counters also stop one failure cycle from spending two units of
+        // budget through `recover_from_dropped_frame`.
+        match self.backend.compositor.frame_submitted() {
+            Ok(_) => {
+                note_frame(&mut self.submit_failures, true);
+            }
+            Err(err) => {
+                tracing::warn!(?err, "failed to mark frame submitted");
+                self.backend.pacer.frame_failed();
+                if note_frame(&mut self.submit_failures, false) {
+                    tracing::error!(
+                        failures = self.submit_failures,
+                        "frame submission has failed continuously; the display is unusable"
+                    );
+                    self.shutdown(1);
+                    return;
+                }
+            }
         }
 
         self.send_frames();
@@ -408,4 +450,75 @@ fn build_output(
     );
 
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_CONSECUTIVE_DROPS, note_frame};
+
+    #[test]
+    fn one_drop_does_not_escalate() {
+        let mut drops = 0;
+        assert!(!note_frame(&mut drops, false));
+        assert_eq!(drops, 1);
+    }
+
+    /// Pins the off-by-one: the escalation must fire *at* the limit, not before.
+    #[test]
+    fn the_budget_escalates_exactly_at_the_limit() {
+        let mut drops = 0;
+        for n in 1..MAX_CONSECUTIVE_DROPS {
+            assert!(
+                !note_frame(&mut drops, false),
+                "escalated early, at drop {n}"
+            );
+        }
+        assert!(
+            note_frame(&mut drops, false),
+            "did not escalate at the limit"
+        );
+        assert_eq!(drops, MAX_CONSECUTIVE_DROPS);
+    }
+
+    /// A flaky-but-recovering display must stay alive: the reset is what keeps it so.
+    ///
+    /// The success is reported *through* `note_frame` rather than by the test
+    /// zeroing the counter itself. That is the whole point — a test that performs
+    /// the reset by hand is byte-for-byte the off-by-one test above and cannot
+    /// observe the reset going missing.
+    #[test]
+    fn a_success_resets_the_budget() {
+        let mut drops = 0;
+        for _ in 1..MAX_CONSECUTIVE_DROPS {
+            note_frame(&mut drops, false);
+        }
+        assert_eq!(
+            drops,
+            MAX_CONSECUTIVE_DROPS - 1,
+            "setup did not spend the budget"
+        );
+
+        assert!(
+            !note_frame(&mut drops, true),
+            "a success must never escalate"
+        );
+        assert_eq!(drops, 0, "a success must clear the budget");
+
+        for n in 1..MAX_CONSECUTIVE_DROPS {
+            assert!(
+                !note_frame(&mut drops, false),
+                "a reset budget escalated early, at drop {n}"
+            );
+        }
+    }
+
+    /// A success on an already-clear budget is not an underflow.
+    #[test]
+    fn repeated_successes_are_harmless() {
+        let mut drops = 0;
+        for _ in 0..3 {
+            assert!(!note_frame(&mut drops, true));
+            assert_eq!(drops, 0);
+        }
+    }
 }
