@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use clap::Parser;
 use smithay::input::keyboard::{Keysym, ModifiersState, xkb};
 
@@ -21,7 +21,7 @@ use smithay::input::keyboard::{Keysym, ModifiersState, xkb};
     // Clap would otherwise render `[COMMAND]...` and never mention `--`, which is
     // what separates the child's flags from ours. The docs and the error path both
     // show this form, so `--help` must agree.
-    override_usage = "kiosk [OPTIONS] -- <COMMAND> [ARGS...]"
+    override_usage = "kiosk [OPTIONS] -- <COMMAND> [ARGS...]\n       kiosk [OPTIONS] --list-outputs"
 )]
 pub struct Cli {
     /// Use this connector, e.g. DP-1 (case-insensitive).
@@ -31,7 +31,7 @@ pub struct Cli {
     #[arg(long, value_name = "CONNECTOR")]
     pub output: Option<String>,
 
-    /// Print the available connectors and exit.
+    /// Print the available connectors and exit. Cannot be combined with a command.
     #[arg(long, conflicts_with = "command")]
     pub list_outputs: bool,
 
@@ -75,7 +75,7 @@ impl Cli {
 /// `--crate-name kiosk` and `module_path!()` — hence every event target — is
 /// `kiosk`. Filtering on `kiosk_rs` matches nothing, which silently reduces every
 /// directive below to its bare global level.
-pub const LOG_TARGET: &str = "kiosk";
+const LOG_TARGET: &str = "kiosk";
 
 /// The `EnvFilter` directive implied by a `-v` count.
 ///
@@ -122,7 +122,10 @@ impl Binding {
 /// name. Keysym lookup is case-insensitive too, so `Q` and `q` both resolve —
 /// use an explicit `Shift+` to require the shift modifier.
 pub fn parse_binding(spec: &str) -> Result<Binding> {
-    let mut parts = spec.split('+').map(str::trim).peekable();
+    let (mods, key) = match spec.rsplit_once('+') {
+        Some((mods, key)) => (Some(mods), key.trim()),
+        None => (None, spec.trim()),
+    };
     let mut binding = Binding {
         ctrl: false,
         alt: false,
@@ -131,16 +134,14 @@ pub fn parse_binding(spec: &str) -> Result<Binding> {
         keysym: Keysym::NoSymbol,
     };
 
-    let mut key: Option<&str> = None;
-    while let Some(part) = parts.next() {
+    // The last component is the keysym; everything before it is a modifier. Split it
+    // off up front rather than discovering it mid-loop: done that way the key is
+    // never optional, so there is no "has no keysym" case to handle. There could not
+    // be one anyway — `split` always yields at least one component — and the branch
+    // that used to guard it was unreachable.
+    for part in mods.into_iter().flat_map(|m| m.split('+')).map(str::trim) {
         if part.is_empty() {
             bail!("empty component in binding {spec:?}");
-        }
-
-        // The last component is the keysym; everything before it is a modifier.
-        if parts.peek().is_none() {
-            key = Some(part);
-            break;
         }
 
         match part.to_ascii_lowercase().as_str() {
@@ -155,7 +156,9 @@ pub fn parse_binding(spec: &str) -> Result<Binding> {
         }
     }
 
-    let key = key.with_context(|| format!("binding {spec:?} has no keysym"))?;
+    if key.is_empty() {
+        bail!("empty component in binding {spec:?}");
+    }
     let keysym = xkb::keysym_from_name(key, xkb::KEYSYM_CASE_INSENSITIVE);
     if keysym == Keysym::NoSymbol {
         bail!("unknown keysym {key:?} in binding {spec:?}");

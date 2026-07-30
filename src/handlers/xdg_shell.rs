@@ -3,16 +3,20 @@
 //! The policy is small enough to state exhaustively:
 //!
 //! - Every toplevel is fullscreen at the output's size. Clients cannot escape
-//!   that geometry: `unset_fullscreen`, `maximize`, and `unmaximize` are
-//!   acknowledged with a configure that keeps them fullscreen, and `move`,
+//!   that geometry: `set_fullscreen`, `unset_fullscreen`, `maximize`, and
+//!   `unmaximize` are acknowledged with a configure that keeps them fullscreen,
+//!   and `move`,
 //!   `resize`, and `minimize` are ignored (the protocol requires no reply).
 //! - Toplevels form a stack. A new one goes on top and takes focus; a destroyed
 //!   one is removed and focus falls to whatever is beneath.
 //! - An empty stack does *not* exit. The compositor's lifetime is the child
 //!   process's, so there is exactly one shutdown trigger.
 //! - Popups are honoured, with the positioner constrained to the output.
-//! - At most 32 toplevels are tracked; a client that exceeds the cap is sent a
-//!   protocol error and disconnected.
+//! - At most 32 toplevels and 64 popups are tracked, and popup chains are capped at
+//!   8 deep; a client that exceeds any of those is sent a protocol error and
+//!   disconnected (see `new_popup` for why depth is the sharp limit). A popup created
+//!   with a *null* parent is rejected outright: Smithay files those where the popup
+//!   count cannot see them.
 //!
 //! Rejecting the *second* toplevel was considered and rejected: a GTK dialog *is*
 //! an `xdg_toplevel`, so refusing it breaks ordinary applications. The cap above is
@@ -20,7 +24,7 @@
 //! far above any real dialog stack.
 
 use smithay::desktop::{
-    PopupKeyboardGrab, PopupKind, PopupPointerGrab, PopupUngrabStrategy, Window,
+    PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, PopupUngrabStrategy, Window,
     find_popup_root_surface,
 };
 use smithay::input::Seat;
@@ -48,6 +52,47 @@ const WL_SURFACE_ERROR_INVALID_SIZE: u32 = 2;
 /// is a protocol error, which disconnects that client rather than killing us.
 const MAX_TOPLEVELS: usize = 32;
 
+/// Cap on simultaneously-tracked popups, across all clients.
+///
+/// Same rationale as [`MAX_TOPLEVELS`], plus the recursion in Smithay's popup tree.
+const MAX_POPUPS: usize = 64;
+
+/// Cap on popup chain depth.
+///
+/// A menu → submenu → sub-submenu is three; nothing real approaches eight. See the
+/// rationale at the enforcement site in `new_popup`.
+pub(crate) const MAX_POPUP_DEPTH: usize = 8;
+
+/// How deep this popup's parent chain already is.
+///
+/// Walks up through the manager, stopping one past the limit — the check itself
+/// must not become the unbounded walk it exists to prevent.
+fn popup_chain_depth(popups: &PopupManager, surface: &PopupSurface) -> usize {
+    let mut depth = 0;
+    let mut current = surface.get_parent_surface();
+    while let Some(parent) = current {
+        depth += 1;
+        if depth > MAX_POPUP_DEPTH {
+            break;
+        }
+        current = match popups.find_popup(&parent) {
+            Some(PopupKind::Xdg(popup)) => popup.get_parent_surface(),
+            _ => None,
+        };
+    }
+    depth
+}
+
+/// Whether a new popup would exceed either cap.
+///
+/// Free function so the boundaries are testable without a GPU. `>=` on the count
+/// (this popup would be the (n+1)th) and `>` on the depth (a chain of exactly
+/// [`MAX_POPUP_DEPTH`] is allowed) are both deliberate, and both are the kind of
+/// comparison a later edit silently gets wrong.
+fn popup_limits_exceeded(count: usize, depth: usize) -> bool {
+    count >= MAX_POPUPS || depth > MAX_POPUP_DEPTH
+}
+
 use crate::focus::FocusTarget;
 use crate::state::Kiosk;
 
@@ -60,9 +105,14 @@ impl XdgShellHandler for Kiosk {
         // A client that opens toplevels in a loop would otherwise grow this stack
         // without bound, and every entry is walked per frame and per input event.
         if self.windows.len() >= MAX_TOPLEVELS {
+            // The cap is compositor-wide, not per client: nothing restricts the
+            // socket to the spawned child, and real applications connect helper
+            // processes. So the client that asks for one beyond the limit is the one
+            // disconnected, which is not necessarily the one that filled it.
             tracing::warn!(
                 limit = MAX_TOPLEVELS,
-                "client exceeded the toplevel limit; disconnecting it"
+                tracked = self.windows.len(),
+                "toplevel limit reached; disconnecting the requesting client"
             );
             // `post_error`, not `Client::kill`. `kill` looks like the right API —
             // "kill this client by triggering a protocol error" — but it only sets a
@@ -80,7 +130,7 @@ impl XdgShellHandler for Kiosk {
             // better for the client than a silent disconnect.
             surface.wl_surface().post_error(
                 WL_SURFACE_ERROR_INVALID_SIZE,
-                format!("too many toplevels (limit {MAX_TOPLEVELS})"),
+                format!("compositor is tracking too many toplevels (limit {MAX_TOPLEVELS})"),
             );
             return;
         }
@@ -98,14 +148,52 @@ impl XdgShellHandler for Kiosk {
         self.refocus();
 
         // The window is gone but the screen still shows it.
-        self.backend.damage();
+        self.backend.pacer.damage();
         self.render();
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
+        // `xdg_surface.get_popup` takes a *nullable* parent, and Smithay keeps it
+        // nullable. A parent-less popup takes the other branch of
+        // `PopupManager::track_popup`: it lands in `unmapped_popups` rather than a
+        // `PopupTree`, and it is never positioned or drawn. This compositor has no
+        // way to give it a parent later — that requires a protocol kiosk-rs does not
+        // implement — so it would sit there forever being rescanned by
+        // `popups.cleanup()` on every event loop iteration. Reject it outright.
+        if surface.get_parent_surface().is_none() {
+            tracing::warn!("client created a popup with no parent; disconnecting it");
+            surface.wl_surface().post_error(
+                WL_SURFACE_ERROR_INVALID_SIZE,
+                "xdg_popup created without a parent surface",
+            );
+            return;
+        }
+
+        // Popups need the same cap as toplevels, and for a sharper reason: Smithay's
+        // popup tree recurses once per chain level on insert, cleanup, send_done and
+        // Drop, and `render_elements` walks it on every commit. An unbounded chain is
+        // both a livelock (the event loop stops servicing input, so `--exit-key` dies)
+        // and a stack overflow — and an overflow aborts rather than unwinds, so it
+        // bypasses `catch_unwind` and skips the CRTC/VT restore entirely.
+        let depth = popup_chain_depth(&self.popups, &surface);
+        if popup_limits_exceeded(self.popup_count, depth) {
+            tracing::warn!(
+                count_limit = MAX_POPUPS,
+                depth_limit = MAX_POPUP_DEPTH,
+                depth,
+                "client exceeded the popup limits; disconnecting it"
+            );
+            surface.wl_surface().post_error(
+                WL_SURFACE_ERROR_INVALID_SIZE,
+                format!("too many popups (limit {MAX_POPUPS}, max depth {MAX_POPUP_DEPTH})"),
+            );
+            return;
+        }
+
         self.constrain_popup(&surface);
-        if let Err(err) = self.popups.track_popup(PopupKind::Xdg(surface)) {
-            tracing::warn!(?err, "failed to track popup");
+        match self.popups.track_popup(PopupKind::Xdg(surface)) {
+            Ok(()) => self.popup_count += 1,
+            Err(err) => tracing::warn!(?err, "failed to track popup"),
         }
         // The initial configure is sent from `CompositorHandler::commit`, which
         // also covers a popup that unmaps and remaps.
@@ -125,7 +213,10 @@ impl XdgShellHandler for Kiosk {
     }
 
     fn popup_destroyed(&mut self, _surface: PopupSurface) {
-        self.backend.damage();
+        // `saturating_sub`: a popup we *rejected* was never counted, but the client
+        // still owns the object, so this can fire for one.
+        self.popup_count = self.popup_count.saturating_sub(1);
+        self.backend.pacer.damage();
         self.render();
     }
 
@@ -318,6 +409,41 @@ delegate_xdg_decoration!(Kiosk);
 
 #[cfg(test)]
 mod tests {
+
+    /// The caps' boundaries. Nothing else covers this arithmetic: matrix row 28 only
+    /// confirms the depth cap is not *too tight* (three levels pass), and no test
+    /// confirms either cap actually rejects — so `depth > MAX_POPUP_DEPTH * 10` or a
+    /// `>=`/`>` slip on the count would survive the entire suite.
+    #[test]
+    fn the_popup_caps_reject_exactly_at_their_limits() {
+        use super::{MAX_POPUP_DEPTH, MAX_POPUPS, popup_limits_exceeded};
+
+        // Count: the cap is on what is already tracked, so the (n+1)th is refused.
+        assert!(
+            !popup_limits_exceeded(MAX_POPUPS - 1, 1),
+            "refused the last permitted popup"
+        );
+        assert!(
+            popup_limits_exceeded(MAX_POPUPS, 1),
+            "admitted one past the count cap"
+        );
+
+        // Depth: a chain of exactly MAX_POPUP_DEPTH is allowed.
+        assert!(
+            !popup_limits_exceeded(0, MAX_POPUP_DEPTH),
+            "refused a chain at the depth cap"
+        );
+        assert!(
+            popup_limits_exceeded(0, MAX_POPUP_DEPTH + 1),
+            "admitted one past the depth cap"
+        );
+
+        // A realistic menu chain is nowhere near either.
+        assert!(
+            !popup_limits_exceeded(3, 3),
+            "refused an ordinary submenu chain"
+        );
+    }
     use super::grab_allowed;
 
     #[test]

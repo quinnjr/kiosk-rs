@@ -6,4 +6,4 @@
 mod compositor;
 mod dmabuf;
 mod seat;
-mod xdg_shell;
+pub(crate) mod xdg_shell;

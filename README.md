@@ -30,11 +30,14 @@ kiosk --output DP-1 --exit-key Ctrl+Alt+BackSpace -- firefox --kiosk https://exa
 ```
 
 `kiosk` exits with the application's own exit status, or `128 + signum` if it died
-by a signal, so it is transparent inside a script or a systemd unit.
+by a signal, so it is transparent inside a script or a systemd unit. Two codes are
+its own: **1** for a kiosk-rs failure (bad arguments, no such output, a fatal
+runtime error) and **125** when the child's status could not be determined. A
+supervisor stop (`SIGTERM`) also exits `128 + signum`, after giving the child the
+same 2-second grace as `--exit-key`. See spec §8.1 for the full table.
 
 If `--output` names a connector that is unknown or disconnected, startup fails and
-lists what is available. There is no fallback: a kiosk that boots to the wrong
-monitor is worse than one that fails loudly.
+lists what is available — there is no fallback (see spec §5.1 for why).
 
 ## Requirements
 
@@ -47,6 +50,14 @@ launched from inside another compositor.
 - System libraries: `libinput`, `libseat`, `libgbm`, `libEGL`, `libudev`,
   `libxkbcommon`, `libdrm`.
 
+**Run the application as an unprivileged user.** The child inherits the
+compositor's uid, and a kiosk is usually started as root at boot. kiosk-rs replaces
+a console stdout/stderr with `/dev/null` and puts the child in its own session so it
+cannot switch VTs, but a child running *as root* does not need an inherited
+descriptor — it can open `/dev/tty0` or `/dev/input/event*` directly and escape the
+kiosk regardless. There is currently no `--child-user` flag, so this has to be
+arranged by the unit file or wrapper that launches kiosk-rs.
+
 ```sh
 cargo build --release   # binary at target/release/kiosk
 ```
@@ -54,8 +65,14 @@ cargo build --release   # binary at target/release/kiosk
 ## Logging
 
 Verbosity maps onto a `tracing` filter targeting `kiosk`; `-vvv` includes Smithay's
-own protocol-level spans and DRM commit detail. `RUST_LOG` overrides the `-v` count
-entirely — but a fatal error is always printed to stderr regardless, so no filter
+own protocol-level spans and DRM commit detail. **`-vvv` records every keystroke** —
+Smithay traces the resolved keysym of each key event — so treat a `-vvv` log as
+sensitive, keep it off shared directories, and do not leave it enabled on a kiosk
+that takes a PIN or password. The sink is created mode `0600`, and kiosk-rs refuses
+a log path that is not a regular file, has more than one hard link, or is owned by
+another user — tightening the mode on a file someone else owns is theatre, since
+they can loosen it again or hard-link it whenever they like. A non-empty `RUST_LOG` overrides the `-v` count
+entirely (an empty one is ignored) — but a fatal error is always printed to stderr regardless, so no filter
 can make a startup failure silent.
 
 Once the TTY is in graphics mode, stderr goes to a console nobody can see, so
@@ -100,20 +117,26 @@ what CI measures:
 | --- | --- | --- | --- |
 | `pacing.rs` | 99% | 99% | the frame-pacing state machine |
 | `cli.rs` | 99% | 99% | argument and keybind parsing |
-| `child.rs` | ~93% | ~93% | spawn, reap, terminate, exit-status mapping |
-| `backend/discovery.rs` | ~73% | ~92% | output enumeration and selection policy |
-| **overall** | **~49%** | **~52%** | |
+| `child.rs` | 92% | 92% | spawn, reap, terminate, exit-status mapping |
+| `backend/discovery.rs` | 67% | 89% | output enumeration and selection policy |
+| `backend/drm.rs` | 17% | 17% | the frame-drop budget (the rest needs a GPU) |
+| **overall** | **51%** | **54%** | |
 
-Both columns are `cargo llvm-cov --summary-only`. The "No GPU" column is what CI
-reports: the DRM tests still *run* there, they just return early once
-`drm_reachable()` is false, so their guards and prologues count as covered. (An
-earlier version of this table measured that column with `--skip hardware_tests`,
-which excludes them entirely and understates it by several points.)
+Both columns are line coverage from `cargo llvm-cov --summary-only`, measured on the
+same machine: the "With a GPU" column directly, and the "No GPU" column by hiding
+`/dev/dri` (`unshare -rm sh -c 'mount -t tmpfs none /dev/dri && cargo llvm-cov'`) so
+the hardware tests take their skip path exactly as they do in CI. The DRM tests still
+*run* in that column — they return early rather than being excluded, so their guards
+and prologues count as covered. (An earlier version measured it with
+`--skip hardware_tests`, which excludes them entirely and understates it.)
 
 A caveat worth knowing: because those tests early-return rather than being
 excluded, the test *count* is identical whether or not a GPU is present, so a CI
 log alone cannot tell you they no-oped. `KIOSK_REQUIRE_DRM=1` is what makes the
-difference visible.
+difference visible — it turns each skip into a failure. Note that the skips are not
+all keyed on the same condition: most test `drm_reachable()`, but
+`a_render_node_yields_no_connectors` keys on whether a *render node* exists, which is
+a strictly narrower check.
 
 `child.rs` tests spawn real processes and poll the real pidfd, so exit-code
 propagation and `128 + signum` are verified end to end rather than mirrored.

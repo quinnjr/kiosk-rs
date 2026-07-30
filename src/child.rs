@@ -36,6 +36,26 @@ const TERMINATE_GRACE: Duration = Duration::from_millis(2000);
 /// for a script to tell this apart from an ordinary failure.
 const REAP_FAILURE_STATUS: i32 = 125;
 
+/// What [`ChildProcess::terminate`] did.
+///
+/// Returned rather than inferred, so a test can assert that the reaped-child guard
+/// actually suppressed the signal — the previous test called `terminate()` and
+/// asserted nothing, and passed with the guard deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Terminate {
+    /// The child had already been waited for; no signal was sent, because the pid
+    /// may now belong to an unrelated process.
+    AlreadyReaped,
+    /// `SIGTERM` was sent (or the child was already gone).
+    Signalled,
+    /// Nothing was sent: either the signal failed (e.g. `EPERM`) or the recorded pid
+    /// was not valid. Distinct from [`Self::Signalled`] because the child may still
+    /// be running with nothing on the way to stop it. The two causes were separate
+    /// variants, but no caller or test ever distinguished them — the differing
+    /// `tracing` messages carry that detail.
+    Failed,
+}
+
 /// A spawned child and the pidfd that reports its exit.
 #[derive(Debug)]
 pub struct ChildProcess {
@@ -66,7 +86,45 @@ impl ChildProcess {
     /// stream the operator redirected to a file or pipe is passed through
     /// untouched. That keeps real logging setups working and closes the escape.
     /// stdin is always `/dev/null`; a kiosk application has no console to read.
+    ///
+    /// # Inherited descriptors above stderr
+    ///
+    /// Not closed here, and not guaranteed closed. `LibSeatSession::open` discards
+    /// the `O_CLOEXEC` this crate passes it, so whether the DRM master fd, the evdev
+    /// fds, and the seatd socket survive `exec` is decided by the system libseat —
+    /// which does set close-on-exec in its own backends, but is not something this
+    /// code verifies. A `close_range(3, ..)` in `pre_exec` would make the guarantee
+    /// ours, and `libc` is now a direct dependency, so availability is no longer the
+    /// obstacle. The obstacle is that `std`'s fork+exec path reports `pre_exec` and
+    /// `exec` failures to the parent over a `CLOEXEC` `SOCK_SEQPACKET` socketpair
+    /// whose descriptor it does not publish (on Linux the same fd also carries the
+    /// pidfd). Closing the range blind would close it, and the parent reads EOF as
+    /// "exec succeeded" — so a failed spawn would be reported as a *successful* one,
+    /// and the child would then die on the closed socket: `std` calls
+    /// `always_abort()` before running our closure, so the write failure becomes
+    /// `SIGABRT` and surfaces as exit `134` instead of the real `exec` errno. Doing
+    /// this safely needs the range to skip that fd, which means not using `Command`.
+    /// Worth revisiting, but not a one-line change.
     pub fn spawn(command: &[String], wayland_display: &str) -> Result<Self> {
+        Self::spawn_with(
+            command,
+            wayland_display,
+            std::io::stdout().is_terminal(),
+            std::io::stderr().is_terminal(),
+        )
+    }
+
+    /// [`Self::spawn`] with the console decision injected.
+    ///
+    /// The `is_terminal` checks are the one part of `spawn` a test cannot control —
+    /// under `cargo test` both streams are pipes, so the console branch would never
+    /// be exercised and a stubbed-out decision would pass.
+    fn spawn_with(
+        command: &[String],
+        wayland_display: &str,
+        stdout_is_console: bool,
+        stderr_is_console: bool,
+    ) -> Result<Self> {
         let (program, args) = command
             .split_first()
             .context("internal error: empty command")?;
@@ -74,8 +132,8 @@ impl ChildProcess {
         let mut cmd = Command::new(program);
         cmd.args(args)
             .stdin(Stdio::null())
-            .stdout(console_safe_stdio(std::io::stdout().is_terminal()))
-            .stderr(console_safe_stdio(std::io::stderr().is_terminal()))
+            .stdout(Stdio::from(stream_plan(stdout_is_console)))
+            .stderr(Stdio::from(stream_plan(stderr_is_console)))
             .env("WAYLAND_DISPLAY", wayland_display)
             // A Wayland client must not fall back to an inherited X11 display.
             .env_remove("DISPLAY")
@@ -85,17 +143,40 @@ impl ChildProcess {
             .env_remove("LD_LIBRARY_PATH")
             .env_remove("LD_AUDIT");
 
-        // SAFETY: `setsid` is async-signal-safe and touches only the calling
-        // (already-forked) process, which is what `pre_exec` requires. Nothing is
-        // logged from here — allocation and locking are not permitted between fork
-        // and exec.
+        // SAFETY: `setsid` and `pthread_sigmask` are both async-signal-safe and
+        // touch only the calling (already-forked) process, which is what `pre_exec`
+        // requires. Nothing is logged from here — allocation and locking are not
+        // permitted between fork and exec.
         unsafe {
             cmd.pre_exec(|| {
                 // `EPERM` means the child is already a session leader, which is
                 // the outcome we wanted. Any other failure leaves it sharing our
-                // session; the console fds are already closed above, so this is a
-                // defence-in-depth measure rather than the load-bearing one.
+                // session; a console stdout/stderr has already been replaced with
+                // `/dev/null` above, so this is a defence-in-depth measure rather
+                // than the load-bearing one.
                 let _ = rustix::process::setsid();
+
+                // Undo the inherited signal mask. calloop's signalfd source blocks
+                // SIGTERM/SIGINT in our thread, and std deliberately does *not*
+                // reset the mask before `exec` ("Inherit the signal mask from the
+                // parent rather than resetting it") — so without this the child
+                // would run with those signals blocked, `terminate()` below could
+                // never be delivered, every shutdown would burn the full
+                // `TERMINATE_GRACE`, and the application would survive as an orphan
+                // on a VT nobody composites. Blocked signals also propagate to
+                // everything the client itself spawns.
+                let mut empty = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+                if libc::sigemptyset(empty.as_mut_ptr()) == 0 {
+                    // Failure here is not recoverable from a `pre_exec` and not
+                    // worth aborting the spawn over: the child still runs, it just
+                    // cannot be stopped politely. `terminate` bounds that at
+                    // `TERMINATE_GRACE` and warns rather than hanging.
+                    let _ = libc::pthread_sigmask(
+                        libc::SIG_SETMASK,
+                        empty.as_ptr(),
+                        std::ptr::null_mut(),
+                    );
+                }
                 Ok(())
             });
         }
@@ -123,9 +204,8 @@ impl ChildProcess {
     /// Called once the pidfd signals readability, so the child has already
     /// exited and this does not block.
     ///
-    /// Death by signal maps to `128 + signum`, matching shell convention, so
-    /// scripts wrapping the compositor see what they would have seen wrapping
-    /// the application directly.
+    /// The status mapping is [`exit_code_of`]; an unreapable child yields
+    /// [`REAP_FAILURE_STATUS`].
     pub fn reap(&mut self) -> i32 {
         self.reaped = true;
         match self.child.wait() {
@@ -152,25 +232,28 @@ impl ChildProcess {
     /// while we wait — but returning instantly would mean the child never gets to
     /// run its handler, and would make the "still running" warning below fire on
     /// every healthy shutdown.
-    pub fn terminate(&mut self) {
+    pub fn terminate(&mut self) -> Terminate {
         if self.reaped {
             // The pid may already have been recycled; signalling it would hit an
             // unrelated process.
             tracing::debug!("child already reaped; not signalling");
-            return;
+            return Terminate::AlreadyReaped;
         }
 
         let pid = self.child.id();
         let Some(signal_target) = Pid::from_raw(pid as i32) else {
             tracing::warn!(pid, "child has an invalid pid; not signalling");
-            return;
+            return Terminate::Failed;
         };
 
         match rustix::process::kill_process(signal_target, Signal::TERM) {
             Ok(()) => tracing::debug!(pid, "sent SIGTERM to child"),
             // The child is already gone; nothing to chase.
             Err(rustix::io::Errno::SRCH) => tracing::debug!(pid, "child already gone"),
-            Err(err) => tracing::warn!(pid, ?err, "failed to signal child"),
+            Err(err) => {
+                tracing::warn!(pid, ?err, "failed to signal child");
+                return Terminate::Failed;
+            }
         }
 
         match self.wait_for_exit(TERMINATE_GRACE) {
@@ -184,6 +267,8 @@ impl ChildProcess {
             }
             Err(err) => tracing::warn!(pid, ?err, "failed to check child status"),
         }
+
+        Terminate::Signalled
     }
 
     /// Poll the pidfd until the child exits or `grace` elapses.
@@ -206,8 +291,13 @@ impl ChildProcess {
                 tv_sec: remaining.as_secs() as _,
                 tv_nsec: remaining.subsec_nanos() as _,
             };
-            // EINTR just means we go round again against the same deadline.
-            let _ = poll(&mut fds, Some(&timeout));
+            // EINTR just means we go round again against the same deadline; any
+            // other error would otherwise spin the loop for the whole grace period
+            // and hide its own cause behind the "child ignored SIGTERM" warning.
+            match poll(&mut fds, Some(&timeout)) {
+                Ok(_) | Err(rustix::io::Errno::INTR) => {}
+                Err(err) => return Err(err).context("failed to poll the child pidfd"),
+            }
         }
     }
 
@@ -217,14 +307,35 @@ impl ChildProcess {
     }
 }
 
-/// `/dev/null` for a console stream, inherit for anything else.
+/// What to do with one of the child's standard streams.
 ///
-/// Separated so the decision is unit-testable without spawning anything.
-fn console_safe_stdio(is_console: bool) -> Stdio {
+/// A named value rather than a bare `Stdio`, because `Stdio` is opaque — no `Debug`,
+/// no `PartialEq` — so a test could only assert `matches!(x, Stdio { .. })`, which is
+/// true of every `Stdio` and passes with the decision inverted. That is exactly the
+/// vacuous guard this type exists to make impossible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamPlan {
+    /// Replace with `/dev/null`: a console fd is a VT-switching capability.
+    Null,
+    /// Pass through: the operator redirected this somewhere, so it is real logging.
+    Inherit,
+}
+
+impl From<StreamPlan> for Stdio {
+    fn from(plan: StreamPlan) -> Self {
+        match plan {
+            StreamPlan::Null => Stdio::null(),
+            StreamPlan::Inherit => Stdio::inherit(),
+        }
+    }
+}
+
+/// `/dev/null` for a console stream, inherit for anything else.
+fn stream_plan(is_console: bool) -> StreamPlan {
     if is_console {
-        Stdio::null()
+        StreamPlan::Null
     } else {
-        Stdio::inherit()
+        StreamPlan::Inherit
     }
 }
 
@@ -339,6 +450,43 @@ mod tests {
             }
         }
         panic!("pidfd never became readable; the child exit path is broken");
+    }
+
+    /// The child must not inherit our blocked signal mask.
+    ///
+    /// calloop's signalfd source blocks SIGTERM/SIGINT in the compositor thread, and
+    /// `std` deliberately does *not* reset the mask before `exec`. Without the
+    /// `pthread_sigmask` in `pre_exec` the client would run with SIGTERM blocked, so
+    /// `terminate` could never stop it: every shutdown would burn the full grace and
+    /// leave the application alive on a VT nobody composites.
+    ///
+    /// This blocks SIGTERM in the *test* thread first, reproducing the compositor's
+    /// state at spawn time, so it fails if the reset is removed.
+    #[test]
+    fn a_child_does_not_inherit_our_blocked_signals() {
+        // SAFETY: `sigemptyset`/`sigaddset`/`pthread_sigmask` on a local sigset.
+        // Per-thread, so this does not disturb the rest of the suite.
+        unsafe {
+            let mut set = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+            assert_eq!(libc::sigemptyset(set.as_mut_ptr()), 0);
+            assert_eq!(libc::sigaddset(set.as_mut_ptr(), libc::SIGTERM), 0);
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_BLOCK, set.as_ptr(), std::ptr::null_mut()),
+                0
+            );
+        }
+
+        // Absolute path via `sh`, matching the rest of this file rather than
+        // relying on a PATH lookup.
+        let mut child = spawn(&["/bin/sh", "-c", "exec sleep 30"]).expect("failed to spawn");
+        assert_eq!(child.terminate(), Terminate::Signalled);
+
+        // `terminate` waits up to TERMINATE_GRACE and reaps on success. If the mask
+        // leaked, SIGTERM was never delivered and the child is still running.
+        assert!(
+            child.reaped,
+            "child survived SIGTERM: it inherited our blocked signal mask"
+        );
     }
 
     fn spawn(args: &[&str]) -> Result<ChildProcess> {
@@ -456,7 +604,7 @@ mod tests {
     fn terminate_kills_a_child_that_honours_sigterm() {
         let mut child = spawn(&["/bin/sh", "-c", "sleep 300"]).unwrap();
 
-        child.terminate();
+        assert_eq!(child.terminate(), Terminate::Signalled);
 
         // The real assertion: the child is gone, and gone *because* of SIGTERM.
         let status = child
@@ -481,8 +629,6 @@ mod tests {
         child.terminate();
         let elapsed = started.elapsed();
 
-        // Bounded, but it must actually wait — returning instantly would mean a
-        // well-behaved child never gets to run its handler.
         assert!(
             elapsed >= TERMINATE_GRACE,
             "terminate gave up after {elapsed:?}, before the grace period"
@@ -509,8 +655,10 @@ mod tests {
         assert_eq!(child.reap(), 0);
         assert!(child.reaped, "reap must record that it waited");
 
-        // Must be a no-op: the pid may already belong to someone else.
-        child.terminate();
+        // Asserting the returned outcome is what makes this fail if the guard is
+        // deleted — the previous version just called `terminate()` and asserted
+        // nothing, and passed either way.
+        assert_eq!(child.terminate(), Terminate::AlreadyReaped);
     }
 
     #[test]
@@ -525,24 +673,46 @@ mod tests {
         assert_eq!(child.reap(), 3);
     }
 
+    /// The decision itself, as a value. Inverting `stream_plan` fails this.
     #[test]
-    fn a_console_stream_is_replaced_but_a_redirected_one_is_kept() {
-        // A console fd is a VT-switching capability; a pipe or file is just logging.
-        assert!(matches!(console_safe_stdio(true), Stdio { .. }));
-        // Behavioural check via the child: with stdout redirected to a pipe (not a
-        // tty), the child must still be able to write to it.
+    fn a_console_stream_is_planned_null_and_a_redirected_one_inherited() {
+        assert_eq!(stream_plan(true), StreamPlan::Null);
+        assert_eq!(stream_plan(false), StreamPlan::Inherit);
+    }
+
+    /// The behaviour, with the console decision forced.
+    ///
+    /// Under `cargo test` both streams are pipes, so `spawn` would take the
+    /// inherit branch and this could not distinguish the fix from its absence —
+    /// which is why `spawn_with` exists.
+    #[test]
+    fn a_forced_console_child_gets_dev_null_not_the_console() {
         let owned = [
             "/bin/sh".to_string(),
             "-c".to_string(),
-            "test ! -t 1".to_string(),
+            r#"exec 3>&1; test "$(readlink /proc/self/fd/3)" = /dev/null"#.to_string(),
         ];
-        let mut child = ChildProcess::spawn(&owned, "wayland-test-0").unwrap();
+        let mut child = ChildProcess::spawn_with(&owned, "wayland-test-0", true, true).unwrap();
         wait_for_pidfd(&child);
         assert_eq!(
             child.reap(),
             0,
-            "child stdout should not be a terminal under test"
+            "a console stdout was not replaced with /dev/null"
         );
+    }
+
+    /// The other half: a redirected stream must be passed through untouched, or the
+    /// application's own logging is silently swallowed.
+    #[test]
+    fn a_redirected_child_stream_is_passed_through() {
+        let owned = [
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            r#"exec 3>&1; test "$(readlink /proc/self/fd/3)" != /dev/null"#.to_string(),
+        ];
+        let mut child = ChildProcess::spawn_with(&owned, "wayland-test-0", false, false).unwrap();
+        wait_for_pidfd(&child);
+        assert_eq!(child.reap(), 0, "a redirected stdout was replaced");
     }
 
     #[test]
@@ -571,12 +741,39 @@ mod tests {
         assert_eq!(child.reap(), 0, "a loader override leaked into the child");
     }
 
+    /// Drives the seam directly — the previous version called `search_path()`, which
+    /// reads the ambient PATH, so it passed with the fallback replaced by `vec![]`.
+    /// The rationale for the fallback itself is on [`search_path`].
     #[test]
     fn an_unset_path_falls_back_to_the_execvp_default() {
-        // `execvp` uses a confstr default when PATH is unset; treating it as empty
-        // would reject a command the spawn would have run.
-        let dirs = search_path();
-        assert!(dirs.contains(&PathBuf::from("/bin")) || dirs.contains(&PathBuf::from("/usr/bin")));
+        assert_eq!(
+            search_path_from(None),
+            vec![PathBuf::from("/bin"), PathBuf::from("/usr/bin")]
+        );
+    }
+
+    #[test]
+    fn an_empty_path_falls_back_to_the_execvp_default_too() {
+        assert_eq!(
+            search_path_from(Some(std::ffi::OsString::new())),
+            vec![PathBuf::from("/bin"), PathBuf::from("/usr/bin")]
+        );
+    }
+
+    #[test]
+    fn search_path_reads_the_environment() {
+        // Pins the wiring without mutating the environment.
+        let expected: Vec<PathBuf> =
+            std::env::split_paths(&std::env::var_os("PATH").expect("PATH is set under cargo test"))
+                .map(|d| {
+                    if d.as_os_str().is_empty() {
+                        PathBuf::from(".")
+                    } else {
+                        d
+                    }
+                })
+                .collect();
+        assert_eq!(search_path(), expected);
     }
 
     #[test]

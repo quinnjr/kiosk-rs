@@ -76,7 +76,7 @@ fn mode_suffix(size: (u16, u16), vrefresh: u32) -> String {
 
 /// The conventional name for a connector, matching what every other compositor
 /// and `drmModeGetConnector` consumer produces.
-pub fn connector_name(info: &connector::Info) -> String {
+fn connector_name(info: &connector::Info) -> String {
     format!("{}-{}", info.interface().as_str(), info.interface_id())
 }
 
@@ -125,7 +125,7 @@ pub fn enumerate<S: Session>(session: &mut S, udev: &UdevBackend) -> Result<Vec<
 ///
 /// Split from [`enumerate`] so the "one broken card must not hide a good one"
 /// behaviour can be tested by passing a deliberately mixed list.
-pub(crate) fn enumerate_devices<S: Session>(
+fn enumerate_devices<S: Session>(
     session: &mut S,
     devices: Vec<PathBuf>,
 ) -> Result<Vec<OutputCandidate>> {
@@ -134,10 +134,14 @@ pub(crate) fn enumerate_devices<S: Session>(
     for path in devices {
         match enumerate_device(session, &path) {
             Ok(mut found) => candidates.append(&mut found),
-            // One unusable card should not prevent us finding the connector on
-            // another. Render-only nodes with no connectors land here too.
+            // One unusable card must not prevent us finding the connector on
+            // another — but it must not vanish either. `warn`, not `debug`: the
+            // default filter drops `debug`, and if this was the *only* card the
+            // user would otherwise see "no connected output found" and go looking
+            // for a cable when the real cause was a permission error. Render nodes
+            // never reach here; they return an empty list above.
             Err(err) => {
-                tracing::debug!(device = %path.display(), ?err, "skipping DRM device");
+                tracing::warn!(device = %path.display(), ?err, "skipping DRM device");
             }
         }
     }
@@ -152,7 +156,7 @@ pub(crate) fn enumerate_devices<S: Session>(
 /// Extracted so the default "first connected connector" can be tested without a
 /// GPU. Determinism matters — without it the default output would follow udev
 /// enumeration order and could differ between boots.
-pub(crate) fn candidate_order(a: &OutputCandidate, b: &OutputCandidate) -> Ordering {
+fn candidate_order(a: &OutputCandidate, b: &OutputCandidate) -> Ordering {
     a.device
         .cmp(&b.device)
         .then_with(|| u32::from(a.connector).cmp(&u32::from(b.connector)))
@@ -365,11 +369,21 @@ mod hardware_tests {
     /// `KIOSK_REQUIRE_DRM=1` (which the manual test procedure does) turns an
     /// unreachable GPU into a failure, so a hardware run cannot silently degrade
     /// into a no-op.
+    /// True when a skip must be escalated to a failure.
+    ///
+    /// One accessor rather than three literal `var_os` reads, so "every skip path
+    /// consults this" is checkable by grepping one function. That matters here: one
+    /// skip path already diverged, routing through `require_drm` — which answers the
+    /// broader "is DRM reachable at all" — and so silently ignored the variable.
+    fn drm_required() -> bool {
+        std::env::var_os("KIOSK_REQUIRE_DRM").is_some()
+    }
+
     fn require_drm(what: &str) -> bool {
         if drm_reachable() {
             return true;
         }
-        if std::env::var_os("KIOSK_REQUIRE_DRM").is_some() {
+        if drm_required() {
             panic!("KIOSK_REQUIRE_DRM is set but {what} is unavailable");
         }
         eprintln!("skipping: {what} unavailable");
@@ -384,7 +398,7 @@ mod hardware_tests {
         match UdevBackend::new("seat0") {
             Ok(udev) => Some(udev),
             Err(err) => {
-                if std::env::var_os("KIOSK_REQUIRE_DRM").is_some() {
+                if drm_required() {
                     panic!("KIOSK_REQUIRE_DRM is set but udev failed: {err}");
                 }
                 eprintln!("skipping: udev unavailable: {err}");
@@ -457,8 +471,31 @@ mod hardware_tests {
             "enumeration order is not stable between calls"
         );
 
-        // Ordering itself is asserted GPU-free in `tests::candidate_order_*`; here
-        // we only check that repeated enumeration is stable.
+        // Non-vacuity: on a reachable GPU there must be something to order.
+        assert!(
+            !first.is_empty(),
+            "enumeration returned nothing on a reachable GPU"
+        );
+        // Sortedness, not just stability. See the note below on why this is
+        // necessary but not sufficient.
+        assert!(
+            first
+                .windows(2)
+                .all(|w| candidate_order(&w[0], &w[1]) != Ordering::Greater),
+            "enumerate() returned candidates out of (device, connector) order: {:?}",
+            first
+                .iter()
+                .map(|c| (&c.device, u32::from(c.connector)))
+                .collect::<Vec<_>>()
+        );
+
+        // Ordering itself is asserted GPU-free in `tests::candidate_order_*`. The
+        // sortedness assertion above is necessary but *not* sufficient: `enumerate`
+        // already sorts the device paths, and the kernel hands back connectors in
+        // ascending handle order, so on a single-GPU machine the natural order
+        // already satisfies it and a deleted `sort_by(candidate_order)` can still
+        // pass here. Determinism across repeated calls is the part this case
+        // genuinely pins.
     }
 
     #[test]
@@ -467,6 +504,15 @@ mod hardware_tests {
         // than logged as failures.
         let render_node = Path::new("/dev/dri/renderD128");
         if !render_node.exists() {
+            // Not `require_drm`: that answers "is DRM reachable at all", and returns
+            // true on a machine that has a card but no render node — precisely this
+            // case — after which control fell through to the skip anyway, so
+            // KIOSK_REQUIRE_DRM silently no-opped. Check the variable directly.
+            assert!(
+                !drm_required(),
+                "KIOSK_REQUIRE_DRM is set but {} does not exist",
+                render_node.display()
+            );
             eprintln!("skipping: no render node on this machine");
             return;
         }

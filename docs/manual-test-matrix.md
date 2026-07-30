@@ -14,9 +14,8 @@ GPU-dependent tests actually ran.
 - A Linux machine with a GPU and at least one connected output.
 - A free virtual terminal. Switch with `Ctrl+Alt+F<n>` and log in on the text
   console; do **not** run these from inside another compositor's terminal.
-- `seatd` running (`systemctl start seatd`, and your user in the `seat` group) or
-  a valid logind session. Without either, libseat has no backend and startup
-  fails with `Function not implemented (os error 38)`.
+- A session provider (`seatd` or logind) — see
+  [Requirements](../README.md#requirements) for the exact symptom when it is missing.
 - Test clients: `foot`, `weston-simple-egl` (from `weston`), and a GTK
   application with a dialog and a menu, e.g. `gedit` or `gnome-text-editor`.
 
@@ -56,6 +55,16 @@ grabs the keyboard and misbehaves leaves no way out but SSH or a power cycle.
 | 24 | From a TTY, `kiosk -- sh -c 'ls -l /proc/self/fd; sleep 5'` | The child's fds 0/1/2 all point at `/dev/null`, not the console. | Console-fd escape closed |
 | 25 | `kiosk -- foot` redirecting output: `kiosk -- foot > /tmp/app.log 2>&1` | `foot`'s own output still reaches `/tmp/app.log` — a redirected stream is passed through, only a console one is replaced. | Child logging preserved |
 | 26 | `RUST_LOG=no_such_target=trace kiosk --output BOGUS-9 -- foot; echo $?` | Exits `1` **with a visible message** — a filter must not be able to silence a fatal error. | Unconditional fatal report |
+| 27 | `kiosk -- foot`, then `kill <pid>` (plain `SIGTERM`) from another VT; `echo $?` | Exits `143` (`128+15`); the screen returns to text mode and `foot` is gone. | Signal handling, teardown on a supervisor stop |
+| 28 | With a GTK app, open a menu, then a submenu, then a sub-submenu | All three appear. Nothing is disconnected — the depth cap is 8. | Popup depth cap not too tight |
+| 29 | `touch /tmp/pre.log && chmod 666 /tmp/pre.log && kiosk --log-file /tmp/pre.log -- foot`, then `stat -c %a /tmp/pre.log` | `600` — an inherited file is tightened, not trusted. | Log sink `fchmod` |
+| 30 | `touch /tmp/a && ln /tmp/a /tmp/b` (hard link), then `kiosk --log-file /tmp/b -- /bin/true; echo $?` | Exits `1`, complaining about hard links. | Log sink link check |
+| 31 | `sudo mkdir -m 0777 /run/kiosk-test` (**no sticky bit**), then as another user `touch /run/kiosk-test/theirs.log`, then as root `kiosk --log-file /run/kiosk-test/theirs.log -- /bin/true; echo $?` | Exits `1`, naming the owning uid. Tightening the mode is not enough — the owner could `chmod` it back or hard-link it at any time. **`/tmp` will not work for this case**: it is sticky, and `fs.protected_regular=1` (the systemd default) denies the `O_CREAT` open of another user's file there with `EACCES` — even for root, which has no bypass — so you would see "Permission denied" from the open and never reach the ownership check. | Log sink ownership check |
+| 32 | `kiosk -- foot`, then `kill <pid>`; time how long until the prompt returns, then `pgrep foot` | Effectively immediate — well under a second. If it takes the **full 2 seconds** the child never received `SIGTERM`, and `pgrep foot` will still match: `terminate` gives up after the grace and leaves it to init, so the application survives as an orphan rather than dying with its parent. That is what an inherited blocked signal mask looks like. | Signal mask reset in the child |
+| 33 | A hand-written client calling `xdg_surface.get_popup` with a **null** parent (no toolkit does this; needs a custom client) | The client is disconnected with a protocol error. It must not accumulate silently — an unparented popup is never positioned or drawn. | Parent-less popup rejection |
+| 34 | A hand-written client rooting a popup tree on an `xdg_surface` that is **never given a role** (not a toplevel), then opening popups in a loop | The 65th popup is refused with a protocol error. The cap counts popups directly, so it must not matter that the tree's root is not a toplevel. | Popup count cap is not derived from the window stack |
+| 35 | `kiosk -- sh -c 'trap "" TERM; sleep 60'` (a child that ignores `SIGTERM`), then `kill <kiosk-pid>`, then **immediately `kill` it again** while it is still in the 2s grace | The console still returns to text mode with a working keyboard. The second signal is queued in the signalfd and delivered only when the mask lifts on teardown, so if the signal source is dropped before libseat closes the seat, the process dies before `libseat_close_seat` restores `KDSETMODE`/`KDSKBMODE` — leaving an unusable console. Most visible with libseat's **builtin** backend (a root kiosk with no seatd/logind), where nothing else cleans up. | Signal source drop order vs libseat teardown |
+| 36 | In a GTK app with two toplevels stacked, hover the **lower** one to raise a tooltip, then click the tooltip | The tooltip's own toplevel is raised. A tooltip takes no grab, so this exercises the popup/subsurface climb rather than the grab path. | `focus_surface` popup resolution |
 
 ## Known limitations to confirm, not fix
 
@@ -81,6 +90,19 @@ description rather than filing it as a bug.
 - **No log rotation.** `--log-file` appends without bound. A display that fails
   continuously escalates to a nonzero exit after ~1s rather than retrying forever,
   so a stuck compositor cannot fill the disk.
+- **Descriptors above stderr are not force-closed in the child.** `LibSeatSession`
+  discards the `O_CLOEXEC` kiosk-rs requests, so close-on-exec for the DRM and evdev
+  fds depends on the system libseat rather than on this code. See the note on
+  `ChildProcess::spawn`.
+- **The child runs as the compositor's user.** On a root kiosk that voids the VT
+  confinement, since a root child can open `/dev/tty0` directly. There is no
+  `--child-user` flag yet; arrange it in the unit file.
+- **Subsurface depth is not capped, only popup depth is.** The same recursion
+  argument applies — Smithay's `is_ancestor` recurses on every `get_subsurface`, and
+  a commit walks the tree — but subsurface creation has no handler hook to reject
+  from, so there is nowhere for this compositor to enforce a limit. A client can
+  therefore still build a deep subsurface chain. Unlike the popup case the compositor's
+  own walks are iterative, so the stack cost is Smithay's, not ours.
 - **`setsid` is best-effort.** If it fails the child shares our session; the console
   descriptors are already closed, so this is defence in depth rather than the
   primary confinement.

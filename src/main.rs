@@ -31,6 +31,7 @@ use smithay::desktop::PopupManager;
 use smithay::input::SeatState;
 use smithay::input::pointer::CursorImageStatus;
 use smithay::reexports::calloop::generic::Generic;
+use smithay::reexports::calloop::signals::{Signal, Signals};
 use smithay::reexports::calloop::{EventLoop, Interest, Mode as CalloopMode, PostAction};
 use smithay::reexports::input::Libinput;
 use smithay::reexports::wayland_server::Display;
@@ -61,8 +62,6 @@ fn main() -> ExitCode {
         return ExitCode::from(EXIT_FAILURE);
     }
 
-    // Validate everything that needs no hardware first, so a typo is reported
-    // without depending on a seat being available.
     // Everything here needs no hardware: argument shape, the keybind, and whether
     // the child binary exists. Spec tier 1 wants all of these reported before the
     // screen is taken, and doing them before `run` also means they are reported
@@ -116,8 +115,6 @@ fn main() -> ExitCode {
 fn init_logging(cli: &Cli) -> Result<()> {
     use tracing_subscriber::EnvFilter;
 
-    // RUST_LOG wins outright over the -v count: it is the escape hatch for
-    // tracing one module without drowning in everything else.
     let filter = EnvFilter::new(filter_directive(
         std::env::var("RUST_LOG").ok().as_deref(),
         cli.verbose,
@@ -125,9 +122,6 @@ fn init_logging(cli: &Cli) -> Result<()> {
 
     match &cli.log_file {
         Some(path) => {
-            // Append rather than truncate: a crash-looping kiosk keeps the
-            // history of every attempt, which is the case logs are most needed
-            // for. Parent directories are deliberately not created.
             let file = open_log_sink(path)?;
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
@@ -172,19 +166,72 @@ fn filter_directive(rust_log: Option<&str>, verbose: u8) -> String {
 /// Append, not truncate, so a crash-looping kiosk keeps the history of every
 /// attempt. Parent directories are deliberately not created.
 fn open_log_sink(path: &Path) -> Result<std::fs::File> {
-    OpenOptions::new()
+    let file = OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
-        .custom_flags(libc_o_nofollow())
+        // NOFOLLOW so a pre-planted symlink cannot redirect a root-owned append.
+        // NONBLOCK so a pre-planted *FIFO* cannot hang startup: opening one
+        // write-only with no reader blocks indefinitely, which would deadlock us
+        // before the regular-file check below ever runs. On a regular file
+        // O_NONBLOCK has no effect, so there is nothing to undo afterwards.
+        .custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32)
         .open(path)
-        .with_context(|| format!("failed to open log file {}", path.display()))
-}
+        .with_context(|| format!("failed to open log file {}", path.display()))?;
 
-/// `O_NOFOLLOW` without pulling in `libc` as a production dependency.
-const fn libc_o_nofollow() -> i32 {
-    // Linux value, stable across architectures that matter here.
-    0o400_000
+    // `mode(0o600)` applies only when *this* call creates the file, and
+    // `O_NOFOLLOW` rejects a symlink but not a pre-created regular file or a hard
+    // link. At `-vvv` this sink records every keysym, so a lesser-privileged user who
+    // pre-creates the path mode 0666 (or hard-links it into their own directory)
+    // would otherwise get root to append a keystroke log for them. Check the fd we
+    // actually opened, then tighten it regardless of who created it.
+    let stat = rustix::fs::fstat(&file).context("failed to stat the log file")?;
+    let is_regular =
+        rustix::fs::FileType::from_raw_mode(stat.st_mode) == rustix::fs::FileType::RegularFile;
+    if !is_regular {
+        anyhow::bail!("log file {} is not a regular file", path.display());
+    }
+    if stat.st_nlink > 1 {
+        anyhow::bail!(
+            "log file {} has {} hard links; refusing to write a log another path can read",
+            path.display(),
+            stat.st_nlink
+        );
+    }
+    // Tightening the mode is not enough on its own: `fchmod` does not change
+    // ownership, so a file the attacker owns can simply be `chmod`ed back to 0644
+    // the moment after we relax, and they can add hard links whenever they like,
+    // defeating the check above after the fact. Refuse a sink we do not own.
+    let euid = rustix::process::geteuid().as_raw();
+    if stat.st_uid != euid {
+        anyhow::bail!(
+            "log file {} is owned by uid {}, not {}; refusing to write a log its owner can re-open",
+            path.display(),
+            stat.st_uid,
+            euid
+        );
+    }
+    // Tolerate a failed tightening *only* when the file already grants nothing to
+    // group or other. Filesystems without Unix permissions (a vfat USB stick on an
+    // appliance, say) reject `fchmod` outright, and failing startup there would be a
+    // regression with no security benefit — the mode is already what we wanted.
+    let already_private = stat.st_mode & 0o077 == 0;
+    if let Err(err) = rustix::fs::fchmod(&file, rustix::fs::Mode::from_bits_truncate(0o600)) {
+        if already_private {
+            tracing::warn!(
+                ?err,
+                path = %path.display(),
+                mode = format!("{:o}", stat.st_mode & 0o777),
+                "could not set the log file's mode; it is already private, continuing"
+            );
+        } else {
+            return Err(
+                anyhow::Error::new(err).context("failed to restrict the log file's permissions")
+            );
+        }
+    }
+
+    Ok(file)
 }
 
 fn run(cli: &Cli, exit_key: Option<cli::Binding>) -> Result<i32> {
@@ -215,6 +262,40 @@ fn run(cli: &Cli, exit_key: Option<cli::Binding>) -> Result<i32> {
         EventLoop::try_new().context("failed to create event loop")?;
     let loop_handle = event_loop.handle();
 
+    // A supervisor stop must run the same teardown as `--exit-key`. Without this,
+    // `systemctl stop` (or any plain `kill`) terminates the process with the default
+    // disposition: no unwind, so no `Drop` for `DrmCompositor` or `LibSeatSession`,
+    // and the `terminate()` call after the loop never runs — leaving the screen
+    // unrestored and the child orphaned with no parent and no console.
+    //
+    // Constructed here but *registered last* (see `wire_up` below), because the two
+    // ends of its lifetime want opposite positions.
+    //
+    // Construction is what has to be early. `Signals` is signalfd-based, so
+    // `Signals::new` blocks the signals with `pthread_sigmask` immediately — and a
+    // mask is per-thread, inherited only by threads created afterwards. Mesa spawns
+    // worker threads during EGL/GLES init, and a process-directed `SIGTERM` goes to
+    // *any* thread that does not block it, so constructing this after
+    // `DrmBackend::init` would leave a driver thread to take the signal with the
+    // default disposition and kill us with no teardown at all — the exact failure
+    // this source exists to prevent, merely made racy instead of certain.
+    //
+    // Registration has to be late, because calloop drops sources in insertion order
+    // and `Signals::drop` calls `thread_unblock`. A second stop signal — an impatient
+    // Ctrl-C, or systemd's stop retry during the child's grace period — is queued in
+    // the signalfd and never read once the loop has exited. Whenever the mask is
+    // lifted, that queued signal is delivered with the default disposition and kills
+    // us on the spot. So this must drop *after* the libseat session notifier, which
+    // is what owns the `Seat` whose `Drop` calls `libseat_close_seat` and restores
+    // `KDSETMODE`/`KDSKBMODE`. Registered first, it dropped first, and the console
+    // was left in graphics mode with the keyboard off — the unrecoverable machine
+    // this whole feature exists to avoid.
+    //
+    // `ChildProcess` undoes the inherited mask in its `pre_exec` so the child can
+    // still be signalled.
+    let signals = Signals::new(&[Signal::SIGTERM, Signal::SIGINT])
+        .context("failed to register a signal handler")?;
+
     let display: Display<Kiosk> = Display::new().context("failed to create Wayland display")?;
     let display_handle = display.handle();
 
@@ -226,7 +307,7 @@ fn run(cli: &Cli, exit_key: Option<cli::Binding>) -> Result<i32> {
         .insert_source(socket, |stream, _, state: &mut Kiosk| {
             if let Err(err) = state
                 .display_handle
-                .insert_client(stream, ClientState::new_arc())
+                .insert_client(stream, Arc::new(ClientState::default()))
             {
                 tracing::warn!(?err, "failed to accept client");
             }
@@ -294,7 +375,7 @@ fn run(cli: &Cli, exit_key: Option<cli::Binding>) -> Result<i32> {
     let xdg_shell_state = XdgShellState::new::<Kiosk>(&display_handle);
     let _xdg_decoration_state = XdgDecorationState::new::<Kiosk>(&display_handle);
     let shm_state = ShmState::new::<Kiosk>(&display_handle, Vec::new());
-    // Held as locals until `run` returns, matching `_xdg_decoration_state` below.
+    // Held as locals until `run` returns, matching `_xdg_decoration_state` above.
     // Dropping these does not withdraw the globals (none of them implement
     // `Drop`); they simply need to outlive the loop.
     let _output_manager_state = OutputManagerState::new_with_xdg_output::<Kiosk>(&display_handle);
@@ -349,10 +430,8 @@ fn run(cli: &Cli, exit_key: Option<cli::Binding>) -> Result<i32> {
             move |event, _, state: &mut Kiosk| match event {
                 SessionEvent::PauseSession => {
                     tracing::info!("session paused");
-                    // The release of the Ctrl+Alt chord that switched away goes to
-                    // the incoming VT, so tell the client those keys are up before
-                    // we stop dispatching. Otherwise it sees them held forever and
-                    // `--exit-key`, which needs exact modifiers, stops matching.
+                    // See `release_all_keys`: the chord's release goes to the
+                    // incoming VT, not to us.
                     state.release_all_keys();
                     libinput_for_session.suspend();
                     state.backend.pause();
@@ -363,7 +442,15 @@ fn run(cli: &Cli, exit_key: Option<cli::Binding>) -> Result<i32> {
                         tracing::error!("failed to resume libinput");
                     }
                     match state.backend.resume() {
-                        Ok(()) => state.render(),
+                        Ok(()) => {
+                            // Frames dropped while master was being revoked are not
+                            // evidence of a permanently broken display, so they must
+                            // not accumulate across VT switches toward the tier-3
+                            // escalation — "60 consecutive" has to mean consecutive.
+                            crate::backend::drm::note_frame(&mut state.consecutive_drops, true);
+                            crate::backend::drm::note_frame(&mut state.submit_failures, true);
+                            state.render();
+                        }
                         Err(err) => {
                             // The screen cannot be driven any more. Exiting runs
                             // the normal teardown, which restores the CRTC and the
@@ -381,10 +468,10 @@ fn run(cli: &Cli, exit_key: Option<cli::Binding>) -> Result<i32> {
     // Start the pointer in the middle of the screen, which is where a user will
     // look for it.
     let pointer_location = {
-        let size = output
-            .current_mode()
-            .map(|mode| mode.size)
-            .unwrap_or_default();
+        // `state::size_of` is the crate's single answer to "how big is this output",
+        // and it logs the modeless case that `build_output` makes unreachable rather
+        // than silently centring the pointer at (0, 0).
+        let size = crate::state::size_of(&output);
         (size.w as f64 / 2.0, size.h as f64 / 2.0).into()
     };
 
@@ -412,8 +499,9 @@ fn run(cli: &Cli, exit_key: Option<cli::Binding>) -> Result<i32> {
         loop_handle: loop_handle.clone(),
         retry_armed: false,
         consecutive_drops: 0,
+        submit_failures: 0,
+        popup_count: 0,
         exit_code: None,
-        child_reaped: false,
     };
 
     // Everything is ready: start the application.
@@ -437,12 +525,24 @@ fn run(cli: &Cli, exit_key: Option<cli::Binding>) -> Result<i32> {
                 move |_, _, state: &mut Kiosk| {
                     // A pidfd becomes readable exactly once, when the child exits.
                     let code = child_for_source.lock().unwrap().reap();
-                    state.child_reaped = true;
                     state.shutdown(code);
                     Ok(PostAction::Remove)
                 },
             )
             .map_err(|err| anyhow::anyhow!("failed to register child watcher: {err}"))?;
+
+        // Last source registered, so it is the last dropped. See the note at its
+        // construction: dropping it unblocks the signals, which must not happen
+        // until libseat has closed the seat and restored the console.
+        loop_handle
+            .insert_source(signals, |event, _, state: &mut Kiosk| {
+                let signal = event.signal();
+                tracing::info!(?signal, "shutting down on signal");
+                // Shell convention, matching how the child's own signal death is
+                // reported, so a supervisor sees a consistent status.
+                state.shutdown(128 + signal as i32);
+            })
+            .map_err(|err| anyhow::anyhow!("failed to register signal source: {err}"))?;
         Ok(())
     };
 
@@ -458,8 +558,15 @@ fn run(cli: &Cli, exit_key: Option<cli::Binding>) -> Result<i32> {
     // Shut the child down before propagating any loop error, so a panic or a
     // fatal DRM error does not leave an orphaned application running on a screen
     // nobody is compositing.
-    if !state.child_reaped {
-        child.lock().unwrap().terminate();
+    // No `child_reaped` check here: `ChildProcess::terminate` already refuses to
+    // signal a reaped child, because its pid may have been recycled. A poisoned lock
+    // means the pidfd callback panicked mid-`reap`; log it rather than unwrapping,
+    // since panicking here would abandon the CRTC and VT restore below.
+    match child.lock() {
+        Ok(mut child) => {
+            child.terminate();
+        }
+        Err(err) => tracing::error!(?err, "child mutex poisoned; not signalling"),
     }
 
     // A recorded child status outranks a loop error: the documented contract is
@@ -554,6 +661,14 @@ fn run_event_loop(event_loop: &mut EventLoop<Kiosk>, state: &mut Kiosk) -> Resul
         // means the screen is black rather than whatever the previous owner of the
         // framebuffer left behind.
         state.render();
+
+        // `EventLoop::run` clears the stop flag on entry, so a shutdown requested by
+        // the first frame — e.g. `recover_from_dropped_frame` failing to arm its
+        // retry timer — would be silently discarded, and `exit_code` would stay
+        // latched at 1, overriding the child's real status later.
+        if state.exit_code.is_some() {
+            return Ok(());
+        }
 
         event_loop.run(None, state, |state| {
             // Popups whose clients are gone would otherwise render forever.
@@ -684,6 +799,56 @@ mod tests {
         let mode = file.metadata().unwrap().mode() & 0o777;
         assert_eq!(mode, 0o600, "log file is readable by others");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The test above removes the path first, so `OpenOptions::mode(0o600)` alone
+    /// satisfies it and the whole hardening block could be deleted without failing
+    /// anything. This is the case that block exists for: a file we did *not* create.
+    #[test]
+    fn a_pre_created_log_file_is_tightened() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let path = std::env::temp_dir().join(format!("kiosk-pre-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        let file = open_log_sink(&path).unwrap();
+        assert_eq!(
+            file.metadata().unwrap().mode() & 0o777,
+            0o600,
+            "an inherited log file was trusted rather than tightened"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_hard_linked_log_file_is_refused() {
+        let dir = std::env::temp_dir();
+        let target = dir.join(format!("kiosk-link-a-{}", std::process::id()));
+        let link = dir.join(format!("kiosk-link-b-{}", std::process::id()));
+        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_file(&link);
+        std::fs::write(&target, b"").unwrap();
+        std::fs::hard_link(&target, &link).unwrap();
+
+        let err = open_log_sink(&link).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("hard link"),
+            "expected the hard-link check to reject this, got: {err:#}"
+        );
+        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_file(&link);
+    }
+
+    /// `/dev/null` is a character device: no setup needed, and a log sink that is
+    /// not a regular file cannot have its permissions meaningfully constrained.
+    #[test]
+    fn a_non_regular_log_path_is_refused() {
+        let err = open_log_sink(Path::new("/dev/null")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("regular file"),
+            "expected the regular-file check to reject this, got: {err:#}"
+        );
     }
 
     #[test]

@@ -9,7 +9,7 @@ use smithay::backend::input::{
     TouchMotionEvent as TouchMotionEventTrait, TouchUpEvent,
 };
 use smithay::backend::libinput::LibinputInputBackend;
-use smithay::desktop::WindowSurfaceType;
+use smithay::desktop::{WindowSurfaceType, find_popup_root_surface};
 use smithay::input::keyboard::FilterResult;
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
 use smithay::input::touch::{DownEvent, MotionEvent as TouchMotionEvent, UpEvent};
@@ -28,7 +28,7 @@ const EXIT_KEY_STATUS: i32 = 0;
 /// APIs expect. Smithay derives the surface-local position as
 /// `event.location - focus.1`, so passing a pointer-relative offset here makes
 /// every client see the pointer at the surface origin.
-type Focus = (FocusTarget, Point<f64, Logical>);
+type FocusUnder = (FocusTarget, Point<f64, Logical>);
 
 /// Confine a pointer position to the output.
 ///
@@ -74,7 +74,7 @@ impl Kiosk {
     pub fn process_input_event(&mut self, event: InputEvent<LibinputInputBackend>) {
         // While another VT is in front we hold no DRM master and should not be
         // delivering input to the client.
-        if !self.backend.is_active() {
+        if !self.backend.pacer.is_active() {
             return;
         }
 
@@ -155,8 +155,7 @@ impl Kiosk {
             },
         );
 
-        // Remember what is held so a VT switch can release it; the physical
-        // release goes to whichever VT is in front, not to us.
+        // Track held keys for `release_all_keys`.
         match key_state {
             KeyState::Pressed => {
                 self.pressed_keys.insert(code);
@@ -196,7 +195,7 @@ impl Kiosk {
         pointer.frame(self);
 
         // The cursor moved, so the composited image is stale.
-        self.backend.damage();
+        self.backend.pacer.damage();
         self.render();
     }
 
@@ -325,7 +324,7 @@ impl Kiosk {
     /// Every window is at the origin and fullscreen, so no per-window offset is
     /// needed. `WindowSurfaceType::ALL` makes Smithay test popups and subsurfaces
     /// as well, and honour input regions.
-    fn surface_under(&self, location: Point<f64, Logical>) -> Option<Focus> {
+    fn surface_under(&self, location: Point<f64, Logical>) -> Option<FocusUnder> {
         self.windows.iter().rev().find_map(|window| {
             window
                 .surface_under(location, WindowSurfaceType::ALL)
@@ -349,10 +348,33 @@ impl Kiosk {
             return;
         }
 
-        // Resolve through subsurface and popup parents to the toplevel.
+        // Climb to the toplevel that owns `target`, alternating between the two
+        // parent relationships until neither moves.
+        //
+        // Both passes are needed, and both orders of a single pass are wrong.
+        // `get_parent` follows only the subsurface tree — xdg-popup parentage is not
+        // in it — so without the popup step a click on a grab-less popup (a tooltip,
+        // say) resolves to the popup itself and silently fails to raise its
+        // toplevel. But `find_popup` is keyed on a popup's *own* surface, so doing
+        // it first misses a click that landed on a subsurface *inside* the popup
+        // (`surface_under` uses `WindowSurfaceType::ALL`, so it can) — the same
+        // defect one level down. A popup's parent may likewise be a subsurface of
+        // the toplevel, so the subsurface walk has to run again afterwards.
         let mut root = target.surface().clone();
-        while let Some(parent) = get_parent(&root) {
-            root = parent;
+        // Bounded by the popup depth cap; a malformed chain must not spin here.
+        for _ in 0..=crate::handlers::xdg_shell::MAX_POPUP_DEPTH {
+            while let Some(parent) = get_parent(&root) {
+                root = parent;
+            }
+            let Some(popup) = self.popups.find_popup(&root) else {
+                break;
+            };
+            match find_popup_root_surface(&popup) {
+                // Already at the root of the popup chain.
+                Ok(next) if next == root => break,
+                Ok(next) => root = next,
+                Err(_) => break,
+            }
         }
 
         let Some(index) = self.windows.iter().position(|window| {
@@ -370,7 +392,7 @@ impl Kiosk {
         let window = self.windows.remove(index);
         self.windows.push(window);
         self.refocus();
-        self.backend.damage();
+        self.backend.pacer.damage();
         self.render();
     }
 }

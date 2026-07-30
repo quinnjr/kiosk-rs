@@ -57,7 +57,7 @@ impl CompositorHandler for Kiosk {
         self.ensure_initial_configure(surface, root.as_ref());
 
         // New content: the frame is out of date.
-        self.backend.damage();
+        self.backend.pacer.damage();
         self.render();
     }
 }
