@@ -62,6 +62,29 @@ arranged by the unit file or wrapper that launches kiosk-rs.
 cargo build --release   # binary at target/release/kiosk
 ```
 
+### Packages
+
+CI builds a `.deb` and an `.rpm` from every release build and uploads them as
+workflow artifacts. Locally:
+
+```sh
+cargo install cargo-deb cargo-generate-rpm
+cargo build --release
+cargo deb --no-build      # target/debian/*.deb
+cargo generate-rpm        # target/generate-rpm/*.rpm
+```
+
+Arch users have [`kiosk-rs-git`](https://aur.archlinux.org/packages/kiosk-rs-git)
+in the AUR.
+
+Two notes if you package this yourself. **`libEGL` is dlopened, not linked**, so
+no dependency scanner finds it — it is added by hand in both package definitions,
+and a package built without it installs cleanly and then fails at startup.
+And `cargo deb` needs `dpkg-dev` present: without it, `$auto` resolves to nothing
+and cargo-deb emits a *warning* rather than an error, producing a `.deb` whose
+`Depends` field has silently lost every library. CI asserts that field is
+populated for exactly that reason.
+
 ## Logging
 
 Verbosity maps onto a `tracing` filter targeting `kiosk`; `-vvv` includes Smithay's
