@@ -235,13 +235,17 @@ which is why it is a separate module.
 ## 6. Logging
 
 `-v` is counted (`clap::ArgAction::Count`) and mapped to a `tracing_subscriber::EnvFilter` directive.
-The filter target is the crate name with underscores, `kiosk_rs`:
+The filter target is `kiosk` — the *crate* name, not the package name. The package
+is `kiosk-rs`, but its only non-test target is the `kiosk` binary, so Cargo compiles
+with `--crate-name kiosk` and every event's `module_path!()` root is `kiosk`.
+A directive naming `kiosk_rs` matches nothing and silently degrades each row below
+to its bare global level.
 
 | Flag | Filter |
 | --- | --- |
-| *(none)* | `kiosk_rs=info,warn` |
-| `-v` | `kiosk_rs=debug,info` |
-| `-vv` | `kiosk_rs=trace,debug` |
+| *(none)* | `kiosk=info,warn` |
+| `-v` | `kiosk=debug,info` |
+| `-vv` | `kiosk=trace,debug` |
 | `-vvv` | `trace` — includes Smithay's protocol-level spans and DRM atomic-commit detail |
 
 If `RUST_LOG` is set it wins outright and the `-v` count is ignored — the standard `tracing`
@@ -267,9 +271,18 @@ Verbose logging on the real target is write-only without a file destination.
 
 ### 6.2 Child streams
 
-The child process inherits stdout and stderr. A kiosk application's own logging should not be
-swallowed by the compositor, and kiosk-rs is not a log multiplexer. kiosk-rs's own logging is what
-moves to `--log-file`; that keeps the two streams separable without extra machinery.
+The child inherits stdout and stderr **unless they are a terminal**, in which case
+they are replaced with `/dev/null`. A kiosk application's own logging should not be
+swallowed, so a stream the operator redirected to a file or pipe passes through
+untouched. But a console descriptor is a VT-switching capability — a compromised
+client can `ioctl(fd, VT_ACTIVATE, n)` on any inherited console fd and drop the
+physical user at a login prompt — and the console is invisible anyway once the TTY
+is in graphics mode. stdin is always `/dev/null`.
+
+The child is also placed in its own session (`setsid`), which removes the
+controlling terminal so `/dev/tty` cannot be reopened. That is defence in depth:
+`setsid` does **not** invalidate descriptors already inherited across `exec`, so
+closing the console streams above is the load-bearing measure.
 
 ## 7. Window and input policy
 
@@ -325,6 +338,10 @@ to the client.
 ## 8. Error handling
 
 Three tiers:
+
+A fatal error is always written to stderr with `eprintln!`, independently of the
+`tracing` subscriber: a filter that matches nothing must not be able to make a
+startup failure silent.
 
 1. **Startup** — no DRM device, connector unknown or disconnected, EGL failure, child binary missing,
    socket bind failure, unwritable log file. All fail before graphics mode, print an `anyhow` context

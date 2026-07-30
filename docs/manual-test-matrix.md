@@ -45,14 +45,17 @@ grabs the keyboard and misbehaves leaves no way out but SSH or a power cycle.
 | 13 | `kiosk --list-outputs` over SSH, no VT needed | Prints every connector with state and preferred mode; exits `0`. | Pre-EGL discovery |
 | 14 | `kiosk --log-file /nonexistent-dir/x.log -- foot; echo $?` | Exits `1` with a visible message while stderr still works. | Log destination failure before graphics mode |
 | 15 | `kiosk -vvv --log-file /tmp/k.log -- foot`, then inspect the file | Contains Smithay protocol-level spans and DRM commit detail. Terminal output is the client's only. | Verbosity mapping, stream separation |
-| 16 | `RUST_LOG=kiosk_rs=warn kiosk -vvv -- foot` | Only warnings from us, despite `-vvv`. | `RUST_LOG` precedence |
+| 16 | `RUST_LOG=kiosk=warn kiosk -vvv -- foot` | Only warnings from us, despite `-vvv`. Note the target is `kiosk`, the crate name — `kiosk_rs` matches nothing. | `RUST_LOG` precedence |
 | 17 | `kiosk -- foot` on a machine with two connected outputs | Only the first connected output lights up; the other stays blank. | Single-output policy |
 | 18 | `kiosk -- /nonexistent-binary; echo $?` | Exits `1` naming the binary, **before** the screen is touched — the console never blanks. | Pre-flight binary check (tier 1 ordering) |
-| 19 | `kiosk -- foot`, then from another VT `sudo udevadm trigger --action=remove /sys/class/drm/card1` (or physically unplug an eGPU) | Exits nonzero with `GPU removed` logged at `error`; does not sit frozen. | Tier 3 GPU-removal handling |
+| 19 | `kiosk -- foot`, then **physically unplug an eGPU** or `echo 1 > /sys/bus/pci/devices/<addr>/remove`. `udevadm trigger --action=remove` is **not** equivalent — it fires a synthetic event while the device is still in sysfs, so it would pass even with a broken matcher. | Exits nonzero with `GPU removed` logged at `error`; does not sit frozen. | Tier 3 GPU-removal handling (dev_t matching) |
 | 20 | Open a menu in a GTK app and hold it open for a minute without moving the mouse | The app stays responsive; the screen does not freeze. | Frame-callback release on empty frames |
 | 21 | In a GTK app, hide a dialog and re-show it | The dialog reappears. | Configure-on-remap |
 | 22 | `kiosk --log-file /tmp/k.log -- foot`, then `stat -c %a /tmp/k.log` | `600`. | Log file not world-readable |
 | 23 | `ln -s /tmp/target /tmp/k.log`, then `kiosk --log-file /tmp/k.log -- /bin/true; echo $?` | Exits `1`; `/tmp/target` is untouched. | `O_NOFOLLOW` on the log sink |
+| 24 | From a TTY, `kiosk -- sh -c 'ls -l /proc/self/fd; sleep 5'` | The child's fds 0/1/2 all point at `/dev/null`, not the console. | Console-fd escape closed |
+| 25 | `kiosk -- foot` redirecting output: `kiosk -- foot > /tmp/app.log 2>&1` | `foot`'s own output still reaches `/tmp/app.log` — a redirected stream is passed through, only a console one is replaced. | Child logging preserved |
+| 26 | `RUST_LOG=no_such_target=trace kiosk --output BOGUS-9 -- foot; echo $?` | Exits `1` **with a visible message** — a filter must not be able to silence a fatal error. | Unconditional fatal report |
 
 ## Known limitations to confirm, not fix
 
@@ -75,4 +78,9 @@ description rather than filing it as a bug.
   devices present at startup. Plugging in a mouse afterwards does not add a
   pointer.
 - **Scale is always 1.** No HiDPI scaling; clients see a scale-1 output.
-- **No log rotation.** `--log-file` appends without bound.
+- **No log rotation.** `--log-file` appends without bound. A display that fails
+  continuously escalates to a nonzero exit after ~1s rather than retrying forever,
+  so a stuck compositor cannot fill the disk.
+- **`setsid` is best-effort.** If it fails the child shares our session; the console
+  descriptors are already closed, so this is defence in depth rather than the
+  primary confinement.

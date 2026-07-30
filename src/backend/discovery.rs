@@ -26,6 +26,13 @@ use smithay::utils::DeviceFd;
 pub struct OutputCandidate {
     /// The DRM device this connector lives on, e.g. `/dev/dri/card1`.
     pub device: PathBuf,
+    /// The device's `dev_t`, captured while it still exists.
+    ///
+    /// Needed to recognise a `UdevEvent::Removed` for this card: by the time that
+    /// event arrives the device is gone from sysfs, so anything that resolves a
+    /// `dev_t` back to a path (`DrmNode::from_dev_id`, `dev_path`) fails and the
+    /// removal would go unnoticed. Numbers survive; paths do not.
+    pub device_id: u64,
     pub connector: connector::Handle,
     /// Connector name in the conventional form, e.g. `DP-1`, `HDMI-A-1`, `eDP-1`.
     pub name: String,
@@ -172,11 +179,29 @@ fn enumerate_device<S: Session>(session: &mut S, path: &Path) -> Result<Vec<Outp
     // when we are done with it. Dropping the fd instead would leave libseat with a
     // `TakeDevice` and no matching `ReleaseDevice` for every card on the seat, so
     // it would keep issuing pause/resume for cards the compositor never uses.
-    let result = read_connectors(path, raw_fd.try_clone()?);
-    if let Err(err) = session.close(raw_fd) {
+    // The clone is what `read_connectors` consumes; the original is what libseat
+    // keyed on at `open` and must get back. Note the explicit match rather than
+    // `?`: an early return here would drop `raw_fd` and leave exactly the
+    // unbalanced `TakeDevice` this function exists to avoid.
+    let cloned = match raw_fd.try_clone() {
+        Ok(fd) => fd,
+        Err(err) => {
+            release(session, path, raw_fd);
+            return Err(err)
+                .with_context(|| format!("failed to duplicate the fd for {}", path.display()));
+        }
+    };
+
+    let result = read_connectors(path, cloned);
+    release(session, path, raw_fd);
+    result
+}
+
+/// Hand a device back to the session, logging rather than propagating a failure.
+fn release<S: Session>(session: &mut S, path: &Path, fd: std::os::fd::OwnedFd) {
+    if let Err(err) = session.close(fd) {
         tracing::debug!(device = %path.display(), ?err, "failed to release DRM device");
     }
-    result
 }
 
 /// Read a device's connectors from an already-open fd.
@@ -186,6 +211,10 @@ fn read_connectors(path: &Path, fd: std::os::fd::OwnedFd) -> Result<Vec<OutputCa
     let resources = fd
         .resource_handles()
         .with_context(|| format!("failed to read DRM resources of {}", path.display()))?;
+
+    let device_id = rustix::fs::stat(path)
+        .map(|stat| stat.st_rdev)
+        .with_context(|| format!("failed to stat {}", path.display()))?;
 
     let mut candidates = Vec::new();
     for handle in resources.connectors() {
@@ -201,6 +230,7 @@ fn read_connectors(path: &Path, fd: std::os::fd::OwnedFd) -> Result<Vec<OutputCa
 
         candidates.push(OutputCandidate {
             device: path.to_path_buf(),
+            device_id,
             connector: *handle,
             name: connector_name(&info),
             connected: info.state() == connector::State::Connected,
@@ -537,6 +567,7 @@ mod tests {
     fn candidate(device: &str, name: &str, connected: bool) -> OutputCandidate {
         OutputCandidate {
             device: PathBuf::from(device),
+            device_id: 0,
             connector: connector::Handle::from(std::num::NonZeroU32::new(1).unwrap()),
             name: name.to_string(),
             connected,
@@ -547,6 +578,7 @@ mod tests {
     fn candidate_with(device: &str, name: &str, connector: u32) -> OutputCandidate {
         OutputCandidate {
             device: PathBuf::from(device),
+            device_id: 0,
             connector: connector::Handle::from(std::num::NonZeroU32::new(connector).unwrap()),
             name: name.to_string(),
             connected: true,

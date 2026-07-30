@@ -21,7 +21,6 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use clap::Parser;
 use smithay::backend::drm::DrmEvent;
-use smithay::backend::drm::DrmNode;
 use smithay::backend::input::InputEvent;
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::renderer::ImportDma;
@@ -70,7 +69,14 @@ fn main() -> ExitCode {
     // without depending on a seat being available at all.
     let exit_key = match cli
         .validate()
-        .and_then(|()| child::preflight(&cli.command))
+        // Not for `--list-outputs`, which legitimately has no command.
+        .and_then(|()| {
+            if cli.list_outputs {
+                Ok(())
+            } else {
+                child::preflight(&cli.command)
+            }
+        })
         .and_then(|()| cli.exit_key.as_deref().map(cli::parse_binding).transpose())
     {
         Ok(exit_key) => exit_key,
@@ -86,12 +92,17 @@ fn main() -> ExitCode {
             // Startup failures happen before graphics mode, so stderr is still
             // visible. The printed chain is what a user running this by hand
             // actually sees; the log line is for the --log-file case.
-            tracing::error!("{err:#}");
-            // Without --log-file the subscriber already writes to stderr, so
-            // printing again would double every fatal diagnostic.
+            // `eprintln!` unconditionally: it is the only report that cannot be
+            // suppressed by a filter. An earlier version emitted this only when
+            // `--log-file` was set, on the assumption that the subscriber would
+            // cover the stderr case — but a `RUST_LOG` that matches nothing (or
+            // any filter below `error`) then made a startup failure exit 1 in
+            // total silence. The `tracing` copy is for the log file, so it is the
+            // one that is conditional.
             if cli.log_file.is_some() {
-                eprintln!("kiosk: {err:#}");
+                tracing::error!("{err:#}");
             }
+            eprintln!("kiosk: {err:#}");
             ExitCode::from(EXIT_FAILURE)
         }
     }
@@ -261,13 +272,15 @@ fn run(cli: &Cli, exit_key: Option<cli::Binding>) -> Result<i32> {
     // Without this, a removed card produces one warning per commit forever while
     // the screen is frozen and the process never exits.
     let chosen_device = chosen.device.clone();
+    let chosen_device_id = chosen.device_id;
     loop_handle
         .insert_source(udev, move |event, _, state: &mut Kiosk| {
+            // Compare `dev_t`, not a path. By the time this fires the device is
+            // gone from sysfs, so `DrmNode::from_dev_id` (which stats
+            // `/sys/dev/char/M:m/device/drm`) and `dev_path` both fail — matching
+            // on a resolved path would silently never fire on a real removal.
             if let UdevEvent::Removed { device_id } = event
-                && DrmNode::from_dev_id(device_id)
-                    .ok()
-                    .and_then(|node| node.dev_path())
-                    .is_some_and(|path| path == chosen_device)
+                && device_id == chosen_device_id
             {
                 tracing::error!(device = %chosen_device.display(), "GPU removed");
                 state.shutdown(EXIT_FAILURE as i32);
@@ -389,6 +402,7 @@ fn run(cli: &Cli, exit_key: Option<cli::Binding>) -> Result<i32> {
         pointer_location,
         exit_key,
         pressed_keys: HashSet::new(),
+        last_input_time: 0,
         popups: PopupManager::default(),
         windows: Vec::new(),
         output,
@@ -397,6 +411,7 @@ fn run(cli: &Cli, exit_key: Option<cli::Binding>) -> Result<i32> {
         loop_signal: event_loop.get_signal(),
         loop_handle: loop_handle.clone(),
         retry_armed: false,
+        consecutive_drops: 0,
         exit_code: None,
         child_reaped: false,
     };
@@ -435,10 +450,6 @@ fn run(cli: &Cli, exit_key: Option<cli::Binding>) -> Result<i32> {
         child.lock().unwrap().terminate();
         return Err(err);
     }
-
-    // Paint the initial black frame so the screen is not showing whatever the
-    // previous owner of the framebuffer left behind.
-    state.render();
 
     tracing::info!(socket = %socket_name, output = %chosen.name, "compositor running");
 
@@ -536,6 +547,14 @@ fn probe_capabilities(libinput: &mut Libinput) -> Result<Capabilities> {
 /// hook that switched VTs itself would fight that same teardown.
 fn run_event_loop(event_loop: &mut EventLoop<Kiosk>, state: &mut Kiosk) -> Result<()> {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // The first frame is inside the guard deliberately: it is the process's
+        // first GLES/DRM submission and the most likely place to panic, and a panic
+        // outside `catch_unwind` would skip the child teardown in `run`, orphaning
+        // the application on a screen nobody composites. Painting it here also
+        // means the screen is black rather than whatever the previous owner of the
+        // framebuffer left behind.
+        state.render();
+
         event_loop.run(None, state, |state| {
             // Popups whose clients are gone would otherwise render forever.
             state.popups.cleanup();
@@ -627,9 +646,9 @@ mod tests {
 
     #[test]
     fn an_absent_or_blank_rust_log_falls_back_to_the_verbose_count() {
-        assert_eq!(filter_directive(None, 0), "kiosk_rs=info,warn");
-        assert_eq!(filter_directive(None, 1), "kiosk_rs=debug,info");
-        assert_eq!(filter_directive(Some(""), 2), "kiosk_rs=trace,debug");
+        assert_eq!(filter_directive(None, 0), "kiosk=info,warn");
+        assert_eq!(filter_directive(None, 1), "kiosk=debug,info");
+        assert_eq!(filter_directive(Some(""), 2), "kiosk=trace,debug");
         assert_eq!(filter_directive(Some("   "), 3), "trace");
     }
 

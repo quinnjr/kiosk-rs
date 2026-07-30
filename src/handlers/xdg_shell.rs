@@ -24,6 +24,7 @@ use smithay::input::pointer::Focus;
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::Resource;
+use smithay::reexports::wayland_server::backend::protocol::ProtocolError;
 use smithay::reexports::wayland_server::protocol::{wl_output, wl_seat};
 use smithay::utils::Serial;
 use smithay::wayland::shell::xdg::decoration::XdgDecorationHandler;
@@ -31,6 +32,12 @@ use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
 };
 use smithay::{delegate_xdg_decoration, delegate_xdg_shell};
+
+/// `wl_display.error` code for "the server is out of resources".
+const WL_DISPLAY_ERROR_NO_MEMORY: u32 = 2;
+
+/// `wl_display` is always object id 1.
+const WL_DISPLAY_OBJECT_ID: u32 = 1;
 
 /// Cap on simultaneously-tracked toplevels.
 ///
@@ -55,15 +62,23 @@ impl XdgShellHandler for Kiosk {
                 limit = MAX_TOPLEVELS,
                 "client exceeded the toplevel limit; disconnecting it"
             );
-            // `wl_display.error` code 2 is `no_memory`, the protocol's "the server
-            // is out of resources"; none of the xdg_wm_base codes means "resource
-            // limit". Posting an error disconnects this client rather than taking
-            // the compositor down with it.
-            const WL_DISPLAY_ERROR_NO_MEMORY: u32 = 2;
-            surface.wl_surface().post_error(
-                WL_DISPLAY_ERROR_NO_MEMORY,
-                format!("too many toplevels (limit {MAX_TOPLEVELS})"),
-            );
+            // `no_memory` is the protocol's "the server is out of resources"; no
+            // xdg_wm_base code means "resource limit". It must be raised against
+            // `wl_display` itself, because an error code is interpreted against the
+            // *referenced object's* interface — posting 2 on the `wl_surface` would
+            // reach the client as `wl_surface.invalid_size` and send it hunting for
+            // a size bug. Killing the client is the point; the compositor lives on.
+            if let Some(client) = surface.wl_surface().client() {
+                client.kill(
+                    &self.display_handle,
+                    ProtocolError {
+                        code: WL_DISPLAY_ERROR_NO_MEMORY,
+                        object_id: WL_DISPLAY_OBJECT_ID,
+                        object_interface: "wl_display".to_string(),
+                        message: format!("too many toplevels (limit {MAX_TOPLEVELS})"),
+                    },
+                );
+            }
             return;
         }
 

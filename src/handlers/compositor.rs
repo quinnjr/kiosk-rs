@@ -31,7 +31,11 @@ impl CompositorHandler for Kiosk {
 
         // A sync subsurface's contents only become visible when its parent
         // commits, so walk up to the root before doing any bookkeeping.
-        if !is_sync_subsurface(surface) {
+        // The root is needed twice — once for `on_commit`, once for the configure
+        // check — and `window_for_surface` documents that callers must pass a root.
+        let root = if is_sync_subsurface(surface) {
+            None
+        } else {
             let mut root = surface.clone();
             while let Some(parent) = get_parent(&root) {
                 root = parent;
@@ -39,7 +43,8 @@ impl CompositorHandler for Kiosk {
             if let Some(window) = self.window_for_surface(&root) {
                 window.on_commit();
             }
-        }
+            Some(root)
+        };
 
         self.popups.commit(surface);
 
@@ -49,7 +54,7 @@ impl CompositorHandler for Kiosk {
         // when a mapped surface unmaps, so a hidden-then-reshown window needs the
         // handshake again. Doing it here rather than in `new_toplevel`/`new_popup`
         // covers both the first map and every remap.
-        self.ensure_initial_configure(surface);
+        self.ensure_initial_configure(surface, root.as_ref());
 
         // New content: the frame is out of date.
         self.backend.damage();
@@ -59,14 +64,21 @@ impl CompositorHandler for Kiosk {
 
 impl Kiosk {
     /// Send the initial configure for a toplevel or popup that has not had one.
-    fn ensure_initial_configure(&mut self, surface: &WlSurface) {
-        if let Some(window) = self.window_for_surface(surface)
-            && let Some(toplevel) = window.toplevel()
-            && !toplevel.is_initial_configure_sent()
+    ///
+    /// `root` is the caller's already-resolved subsurface root, or `None` for a sync
+    /// subsurface. A surface has exactly one role, so a toplevel match rules out a
+    /// popup — and skipping the popup lookup for a known toplevel avoids an
+    /// allocating walk of every popup tree on the hot commit path.
+    fn ensure_initial_configure(&mut self, surface: &WlSurface, root: Option<&WlSurface>) {
+        if let Some(toplevel) = root
+            .and_then(|root| self.window_for_surface(root))
+            .and_then(|window| window.toplevel())
+            .cloned()
         {
-            let toplevel = toplevel.clone();
-            self.configure_fullscreen(&toplevel);
-            toplevel.send_configure();
+            if !toplevel.is_initial_configure_sent() {
+                self.configure_fullscreen(&toplevel);
+                toplevel.send_configure();
+            }
             return;
         }
 

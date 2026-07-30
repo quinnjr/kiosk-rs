@@ -51,6 +51,14 @@ const COLOR_FORMATS: [Fourcc; 2] = [Fourcc::Xrgb8888, Fourcc::Argb8888];
 /// suggest. Exact timing does not matter: this only has to break the stall.
 const RETRY_INTERVAL: Duration = Duration::from_millis(16);
 
+/// Consecutive dropped frames before a transient fault is treated as permanent.
+///
+/// At [`RETRY_INTERVAL`] this is about a second. Retrying forever would trade a
+/// visible freeze for an invisible one: the screen would still be stuck, while the
+/// retry loop wrote thousands of warnings a minute into a log that has no rotation.
+/// Exiting lets a supervisor restart us, which is the tier-3 contract.
+const MAX_CONSECUTIVE_DROPS: u32 = 60;
+
 pub struct DrmBackend {
     pub drm: DrmDevice,
     pub renderer: GlesRenderer,
@@ -244,6 +252,9 @@ impl Kiosk {
         self.update_scanout_state(&frame.states);
 
         if frame.is_empty {
+            // An empty frame is a success, not a drop: the render worked and there
+            // was simply nothing new to show.
+            self.consecutive_drops = 0;
             // Nothing changed, so there is no flip to queue and therefore no
             // vblank coming. Clients still waiting on a frame callback must be
             // released here, or a client that commits without visible damage
@@ -254,7 +265,10 @@ impl Kiosk {
         }
 
         match self.backend.compositor.queue_frame(()) {
-            Ok(()) => self.backend.pacer.frame_queued(),
+            Ok(()) => {
+                self.consecutive_drops = 0;
+                self.backend.pacer.frame_queued();
+            }
             Err(err) => {
                 tracing::warn!(?err, "failed to queue frame");
                 self.backend.pacer.frame_failed();
@@ -272,6 +286,16 @@ impl Kiosk {
     /// compositor until an input event happens to arrive.
     fn recover_from_dropped_frame(&mut self) {
         self.send_frames();
+
+        self.consecutive_drops += 1;
+        if self.consecutive_drops >= MAX_CONSECUTIVE_DROPS {
+            tracing::error!(
+                drops = self.consecutive_drops,
+                "frames have failed continuously; the display is unusable"
+            );
+            self.shutdown(1);
+            return;
+        }
 
         if self.retry_armed {
             return;

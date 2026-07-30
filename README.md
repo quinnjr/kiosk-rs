@@ -53,9 +53,10 @@ cargo build --release   # binary at target/release/kiosk
 
 ## Logging
 
-Verbosity maps onto a `tracing` filter; `-vvv` includes Smithay's own
-protocol-level spans and DRM commit detail. `RUST_LOG` overrides the `-v` count
-entirely.
+Verbosity maps onto a `tracing` filter targeting `kiosk`; `-vvv` includes Smithay's
+own protocol-level spans and DRM commit detail. `RUST_LOG` overrides the `-v` count
+entirely — but a fatal error is always printed to stderr regardless, so no filter
+can make a startup failure silent.
 
 Once the TTY is in graphics mode, stderr goes to a console nobody can see, so
 `--log-file` is what makes verbose logging useful on the real target. It appends,
@@ -90,16 +91,24 @@ The testable logic is deliberately concentrated. Coverage depends on whether the
 machine has a reachable GPU, so both numbers are given — the "no GPU" column is
 what CI measures:
 
-| Module | No GPU | With a GPU | What it holds |
+| Module | No GPU (CI) | With a GPU | What it holds |
 | --- | --- | --- | --- |
 | `pacing.rs` | 99% | 99% | the frame-pacing state machine |
 | `cli.rs` | 99% | 99% | argument and keybind parsing |
-| `child.rs` | 93% | 93% | spawn, reap, terminate, exit-status mapping |
-| `backend/discovery.rs` | 46% | 92% | output enumeration and selection policy |
-| **overall** | **45%** | **52%** | |
+| `child.rs` | ~93% | ~93% | spawn, reap, terminate, exit-status mapping |
+| `backend/discovery.rs` | ~73% | ~92% | output enumeration and selection policy |
+| **overall** | **~49%** | **~52%** | |
 
-(Measured with `cargo llvm-cov`; the "no GPU" column is
-`cargo llvm-cov -- --skip hardware_tests`.)
+Both columns are `cargo llvm-cov --summary-only`. The "No GPU" column is what CI
+reports: the DRM tests still *run* there, they just return early once
+`drm_reachable()` is false, so their guards and prologues count as covered. (An
+earlier version of this table measured that column with `--skip hardware_tests`,
+which excludes them entirely and understates it by several points.)
+
+A caveat worth knowing: because those tests early-return rather than being
+excluded, the test *count* is identical whether or not a GPU is present, so a CI
+log alone cannot tell you they no-oped. `KIOSK_REQUIRE_DRM=1` is what makes the
+difference visible.
 
 `child.rs` tests spawn real processes and poll the real pidfd, so exit-code
 propagation and `128 + signum` are verified end to end rather than mirrored.
