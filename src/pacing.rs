@@ -21,7 +21,7 @@
 //! Note that invariant 2 is about this type only. Nothing here can guarantee that
 //! somebody *calls* `poll` again — the caller owes a wake-up on every path that
 //! does not queue a flip, since without a flip there is no vblank. See
-//! `DrmBackend::recover_from_dropped_frame`.
+//! `Kiosk::recover_from_dropped_frame` in `backend::drm`.
 //!
 //! Keeping this as a plain struct with no GPU handles means every transition is
 //! directly testable, including the ones that only occur around a VT switch.

@@ -54,10 +54,16 @@ impl Kiosk {
         let Some(keyboard) = self.seat.get_keyboard() else {
             return;
         };
+        // Reuse libinput's clock, not `start_time`. Real key events carry
+        // milliseconds since boot; `start_time.elapsed()` is milliseconds since the
+        // compositor started, so a synthetic release would be timestamped far in
+        // the past relative to the press it releases, and a client that filters on
+        // monotonic timestamps could discard it — the exact stuck-modifier failure
+        // this function exists to prevent.
+        let time = self.last_input_time;
         let held: Vec<_> = self.pressed_keys.drain().collect();
         for code in held {
             let serial = SERIAL_COUNTER.next_serial();
-            let time = self.start_time.elapsed().as_millis() as u32;
             keyboard.input::<(), _>(self, code, KeyState::Released, serial, time, |_, _, _| {
                 FilterResult::Forward
             });
@@ -112,6 +118,9 @@ impl Kiosk {
 
         let serial = SERIAL_COUNTER.next_serial();
         let time = event.time_msec();
+        // Remember the timebase so `release_all_keys` can synthesise releases that
+        // are not in the past relative to the presses they release.
+        self.last_input_time = time;
         let code = event.key_code();
         let key_state = event.state();
         let exit_key = self.exit_key;

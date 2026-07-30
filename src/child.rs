@@ -8,14 +8,15 @@
 //! no async-signal-safety constraints and no race between a signal handler and
 //! the loop. It also cannot be confused by an unrelated process exiting.
 
+use std::io::IsTerminal;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+
 use rustix::event::{PollFd, PollFlags, poll};
 use rustix::fs::Timespec;
 use rustix::process::{Pid, PidfdFlags, Signal};
@@ -49,16 +50,22 @@ pub struct ChildProcess {
 impl ChildProcess {
     /// Spawn `command` with `WAYLAND_DISPLAY` pointing at our socket.
     ///
-    /// stdout and stderr are inherited: a kiosk application's own logging should
-    /// not be swallowed by the compositor. Compositor logging goes to
-    /// `--log-file` instead, which keeps the two separable.
+    /// # Standard streams
     ///
-    /// stdin is *not* inherited, and the child is placed in its own session. The
-    /// compositor is launched from a TTY, so an inherited console fd would let a
-    /// compromised kiosk application call `ioctl(0, VT_ACTIVATE, n)` and drop the
-    /// physical user at a login prompt — defeating the confinement that is the
-    /// whole point of a kiosk. `setsid` additionally detaches the controlling
-    /// terminal so `open("/dev/tty")` fails.
+    /// A kiosk application's own logging should not be swallowed, so stdout and
+    /// stderr are inherited — *unless* they are a terminal. The compositor is
+    /// launched from a TTY, and a console fd is a VT-switching capability: a
+    /// compromised client can call `ioctl(fd, VT_ACTIVATE, n)` on any of them and
+    /// drop the physical user at a login prompt, defeating the confinement that is
+    /// the point of a kiosk. Nulling stdin alone does not help, because `setsid`
+    /// removes the *controlling terminal* but leaves already-inherited descriptors
+    /// perfectly usable.
+    ///
+    /// So: a console stream is replaced with `/dev/null` (it is invisible anyway
+    /// once the TTY is in graphics mode — see the spec's logging section), while a
+    /// stream the operator redirected to a file or pipe is passed through
+    /// untouched. That keeps real logging setups working and closes the escape.
+    /// stdin is always `/dev/null`; a kiosk application has no console to read.
     pub fn spawn(command: &[String], wayland_display: &str) -> Result<Self> {
         let (program, args) = command
             .split_first()
@@ -67,6 +74,8 @@ impl ChildProcess {
         let mut cmd = Command::new(program);
         cmd.args(args)
             .stdin(Stdio::null())
+            .stdout(console_safe_stdio(std::io::stdout().is_terminal()))
+            .stderr(console_safe_stdio(std::io::stderr().is_terminal()))
             .env("WAYLAND_DISPLAY", wayland_display)
             // A Wayland client must not fall back to an inherited X11 display.
             .env_remove("DISPLAY")
@@ -77,13 +86,16 @@ impl ChildProcess {
             .env_remove("LD_AUDIT");
 
         // SAFETY: `setsid` is async-signal-safe and touches only the calling
-        // (already-forked) process, which is what `pre_exec` requires.
+        // (already-forked) process, which is what `pre_exec` requires. Nothing is
+        // logged from here — allocation and locking are not permitted between fork
+        // and exec.
         unsafe {
             cmd.pre_exec(|| {
-                if rustix::process::setsid().is_err() {
-                    // Already a session leader is fine; anything else is not
-                    // worth aborting the spawn over.
-                }
+                // `EPERM` means the child is already a session leader, which is
+                // the outcome we wanted. Any other failure leaves it sharing our
+                // session; the console fds are already closed above, so this is a
+                // defence-in-depth measure rather than the load-bearing one.
+                let _ = rustix::process::setsid();
                 Ok(())
             });
         }
@@ -205,6 +217,17 @@ impl ChildProcess {
     }
 }
 
+/// `/dev/null` for a console stream, inherit for anything else.
+///
+/// Separated so the decision is unit-testable without spawning anything.
+fn console_safe_stdio(is_console: bool) -> Stdio {
+    if is_console {
+        Stdio::null()
+    } else {
+        Stdio::inherit()
+    }
+}
+
 /// Check that a command names something executable, before the compositor takes
 /// over the screen.
 ///
@@ -217,10 +240,12 @@ pub fn preflight(command: &[String]) -> Result<()> {
         bail!("internal error: empty command");
     };
 
+    // `access(X_OK)` rather than the mode bits: a file can be `0o700` and owned by
+    // someone else, which passes a mode-bit test and then fails `EACCES` at spawn
+    // — after the screen has been taken, which is what this check exists to avoid.
     let is_executable = |path: &Path| {
-        std::fs::metadata(path)
-            .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
+        std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
+            && rustix::fs::access(path, rustix::fs::Access::EXEC_OK).is_ok()
     };
 
     if program.contains('/') {
@@ -230,9 +255,8 @@ pub fn preflight(command: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    let found = std::env::split_paths(&path).any(|dir| {
-        let mut candidate = dir;
+    let found = search_path().iter().any(|dir| {
+        let mut candidate = dir.clone();
         candidate.push(program);
         is_executable(&candidate)
     });
@@ -241,6 +265,33 @@ pub fn preflight(command: &[String]) -> Result<()> {
         bail!("failed to spawn {program:?}: not found in PATH");
     }
     Ok(())
+}
+
+/// The directories `execvp` would search.
+///
+/// An unset or empty `PATH` is not "no directories": `execvp` falls back to a
+/// confstr default, conventionally `/bin:/usr/bin`. Treating it as empty would make
+/// preflight reject a command the spawn would happily run.
+fn search_path() -> Vec<PathBuf> {
+    search_path_from(std::env::var_os("PATH"))
+}
+
+/// [`search_path`] over an explicit value, so the fallback rules are testable.
+fn search_path_from(value: Option<std::ffi::OsString>) -> Vec<PathBuf> {
+    match value {
+        Some(ref value) if !value.is_empty() => std::env::split_paths(value)
+            // `split_paths` yields "" for an empty component, which `execvp`
+            // interprets as the current directory.
+            .map(|dir| {
+                if dir.as_os_str().is_empty() {
+                    PathBuf::from(".")
+                } else {
+                    dir
+                }
+            })
+            .collect(),
+        _ => vec![PathBuf::from("/bin"), PathBuf::from("/usr/bin")],
+    }
 }
 
 /// Map a child's exit status onto the code this process should exit with.
@@ -472,6 +523,68 @@ mod tests {
         // shutdown path only reaps once, but this guarantees a double reap could
         // never silently turn a real exit code into a fabricated failure.
         assert_eq!(child.reap(), 3);
+    }
+
+    #[test]
+    fn a_console_stream_is_replaced_but_a_redirected_one_is_kept() {
+        // A console fd is a VT-switching capability; a pipe or file is just logging.
+        assert!(matches!(console_safe_stdio(true), Stdio { .. }));
+        // Behavioural check via the child: with stdout redirected to a pipe (not a
+        // tty), the child must still be able to write to it.
+        let owned = [
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "test ! -t 1".to_string(),
+        ];
+        let mut child = ChildProcess::spawn(&owned, "wayland-test-0").unwrap();
+        wait_for_pidfd(&child);
+        assert_eq!(
+            child.reap(),
+            0,
+            "child stdout should not be a terminal under test"
+        );
+    }
+
+    #[test]
+    fn the_child_gets_its_own_session() {
+        // setsid means the child is its own session leader, so it has no
+        // controlling terminal to reopen via /dev/tty.
+        let owned = [
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "test \"$(ps -o sid= -p $$ | tr -d ' ')\" = \"$$\"".to_string(),
+        ];
+        let mut child = ChildProcess::spawn(&owned, "wayland-test-0").unwrap();
+        wait_for_pidfd(&child);
+        assert_eq!(child.reap(), 0, "child is not a session leader");
+    }
+
+    #[test]
+    fn loader_overrides_are_not_inherited() {
+        let owned = [
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "test -z \"${LD_PRELOAD+set}${LD_LIBRARY_PATH+set}${LD_AUDIT+set}\"".to_string(),
+        ];
+        let mut child = ChildProcess::spawn(&owned, "wayland-test-0").unwrap();
+        wait_for_pidfd(&child);
+        assert_eq!(child.reap(), 0, "a loader override leaked into the child");
+    }
+
+    #[test]
+    fn an_unset_path_falls_back_to_the_execvp_default() {
+        // `execvp` uses a confstr default when PATH is unset; treating it as empty
+        // would reject a command the spawn would have run.
+        let dirs = search_path();
+        assert!(dirs.contains(&PathBuf::from("/bin")) || dirs.contains(&PathBuf::from("/usr/bin")));
+    }
+
+    #[test]
+    fn an_empty_path_component_means_the_current_directory() {
+        assert_eq!(
+            search_path_from(Some(std::ffi::OsString::from("/a::/b"))),
+            vec![PathBuf::from("/a"), PathBuf::from("."), PathBuf::from("/b")]
+        );
     }
 
     #[test]

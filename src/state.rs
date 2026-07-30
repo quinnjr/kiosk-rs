@@ -66,6 +66,9 @@ pub struct Kiosk {
     /// Keys the client currently believes are held. Needed because the release of
     /// a `Ctrl+Alt+F<n>` chord is delivered to the incoming VT, not to us.
     pub pressed_keys: HashSet<Keycode>,
+    /// The most recent libinput event timestamp, in libinput's timebase.
+    /// Synthetic key releases reuse it so they are never stamped in the past.
+    pub last_input_time: u32,
 
     // Shell.
     pub popups: PopupManager,
@@ -83,6 +86,10 @@ pub struct Kiosk {
     pub loop_handle: LoopHandle<'static, Kiosk>,
     /// True while a retry timer is pending, so a burst of failures arms one timer.
     pub retry_armed: bool,
+    /// Frames dropped in a row. Reset by any successful render; used to escalate a
+    /// permanently-failing display from tier 2 to tier 3 instead of retrying
+    /// forever.
+    pub consecutive_drops: u32,
     /// Set when the compositor should shut down, and with what status.
     pub exit_code: Option<i32>,
     /// True once the child has exited and been reaped. Distinguishes "the child
@@ -237,7 +244,12 @@ impl Kiosk {
 
     /// Record which output each surface was scanned out on, so
     /// [`Self::send_frames`] can throttle correctly.
-    pub fn update_scanout_state(&self, states: &RenderElementStates) {
+    pub fn update_scanout_state(&mut self, states: &RenderElementStates) {
+        // One of the two read paths named in `drop_dead_cursor`'s doc. Guarding
+        // here rather than relying on `render_elements` having run first means the
+        // safety does not depend on call ordering inside `render`.
+        self.drop_dead_cursor();
+
         for window in &self.windows {
             window.with_surfaces(|surface, surface_states| {
                 update_surface_primary_scanout_output(

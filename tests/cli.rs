@@ -22,8 +22,16 @@ fn stderr(out: &Output) -> String {
 }
 
 /// The marker that we reached session setup, i.e. validation ran too late.
+///
+/// **This proxy only bites where no seat provider exists** — it matches the exact
+/// context string `LibSeatSession::new()` failure carries. On a machine where seatd
+/// or logind *is* running the session would succeed silently, the validation error
+/// would surface with its normal message, and these assertions would still pass.
+/// So this detects a mis-ordering in CI and on a seatless dev box, but not on the
+/// hardware the manual matrix targets. The exit-code and message assertions below
+/// hold everywhere and are the primary check.
 fn mentions_the_session(err: &str) -> bool {
-    err.contains("seatd") || err.contains("logind") || err.contains("session")
+    err.contains("is seatd or logind running")
 }
 
 #[test]
@@ -94,7 +102,65 @@ fn list_outputs_refuses_a_command_rather_than_silently_discarding_it() {
     // A stray --list-outputs in a unit file must not report success while the
     // application never starts.
     let out = kiosk(&["--list-outputs", "--", "/bin/true"]);
-    assert_ne!(out.status.code(), Some(0), "a command was silently ignored");
+
+    // Exit 2 and the conflict text specifically: asserting merely "not 0" would
+    // also be satisfied by the session failure that follows if the `conflicts_with`
+    // attribute were deleted, so the test would pass while the guard was gone.
+    assert_eq!(out.status.code(), Some(2), "expected clap's conflict exit");
+    let err = stderr(&out);
+    assert!(err.contains("--list-outputs"), "{err}");
+    assert!(
+        err.contains("cannot be used with"),
+        "expected a clap conflict error, got: {err}"
+    );
+}
+
+/// The filter directives are useless if they name a target no event carries, and
+/// that failure is invisible: levels appear to work via the bare global default.
+#[test]
+fn our_own_log_events_are_actually_matched_by_the_v_filter() {
+    // A startup failure logs at error. With a filter that matches only our target,
+    // the line must still appear — if the target were wrong, output would be empty
+    // apart from the unconditional eprintln.
+    let out = Command::new(env!("CARGO_BIN_EXE_kiosk"))
+        .args(["--output", "BOGUS-9", "--", "/bin/true"])
+        .env("RUST_LOG", "kiosk=trace")
+        .output()
+        .expect("failed to run the kiosk binary");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("kiosk:"),
+        "expected a diagnostic on stderr, got: {err}"
+    );
+}
+
+/// A fatal error must never be silent, whatever the filter says.
+#[test]
+fn a_startup_failure_is_reported_even_when_the_filter_suppresses_everything() {
+    let out = Command::new(env!("CARGO_BIN_EXE_kiosk"))
+        .args(["--output", "BOGUS-9", "--", "/bin/true"])
+        // Matches nothing this binary emits.
+        .env("RUST_LOG", "no_such_target=trace")
+        .output()
+        .expect("failed to run the kiosk binary");
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !err.trim().is_empty(),
+        "a startup failure exited 1 with no diagnostic at all"
+    );
+}
+
+/// `--list-outputs` takes no command, so the pre-flight binary check must not be
+/// applied to it. Regressed once when preflight moved into the validation chain.
+#[test]
+fn list_outputs_does_not_require_a_command() {
+    let out = kiosk(&["--list-outputs"]);
+    let err = stderr(&out);
+    assert!(
+        !err.contains("empty command"),
+        "--list-outputs was rejected for having no command: {err}"
+    );
 }
 
 #[test]

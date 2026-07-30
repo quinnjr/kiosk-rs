@@ -68,14 +68,24 @@ impl Cli {
     }
 }
 
+/// The `tracing` target our own events carry.
+///
+/// This is the *crate* name, not the package name. The package is `kiosk-rs` but
+/// its only non-test target is the `kiosk` binary, so Cargo compiles it with
+/// `--crate-name kiosk` and `module_path!()` — hence every event target — is
+/// `kiosk`. Filtering on `kiosk_rs` matches nothing, which silently reduces every
+/// directive below to its bare global level.
+#[cfg(test)]
+pub const LOG_TARGET: &str = "kiosk";
+
 /// The `EnvFilter` directive implied by a `-v` count.
 ///
 /// `RUST_LOG` takes precedence over this and is handled by the caller.
 pub fn log_filter(verbose: u8) -> &'static str {
     match verbose {
-        0 => "kiosk_rs=info,warn",
-        1 => "kiosk_rs=debug,info",
-        2 => "kiosk_rs=trace,debug",
+        0 => "kiosk=info,warn",
+        1 => "kiosk=debug,info",
+        2 => "kiosk=trace,debug",
         _ => "trace",
     }
 }
@@ -169,11 +179,30 @@ mod tests {
 
     #[test]
     fn log_filter_saturates() {
-        assert_eq!(log_filter(0), "kiosk_rs=info,warn");
-        assert_eq!(log_filter(1), "kiosk_rs=debug,info");
-        assert_eq!(log_filter(2), "kiosk_rs=trace,debug");
+        assert_eq!(log_filter(0), "kiosk=info,warn");
+        assert_eq!(log_filter(1), "kiosk=debug,info");
+        assert_eq!(log_filter(2), "kiosk=trace,debug");
         assert_eq!(log_filter(3), "trace");
         assert_eq!(log_filter(9), "trace");
+    }
+
+    /// The directives are worthless if they name a target no event carries.
+    /// `module_path!()` here is the crate root, which is what a directive must
+    /// match.
+    #[test]
+    fn the_filter_target_matches_this_crates_real_module_path() {
+        let crate_root = module_path!().split("::").next().unwrap();
+        assert_eq!(
+            crate_root, LOG_TARGET,
+            "log directives target {LOG_TARGET:?} but events are emitted as {crate_root:?}"
+        );
+        for verbose in 0..=2 {
+            assert!(
+                log_filter(verbose).starts_with(crate_root),
+                "-v{verbose} directive {:?} does not match target {crate_root:?}",
+                log_filter(verbose)
+            );
+        }
     }
 
     #[test]
