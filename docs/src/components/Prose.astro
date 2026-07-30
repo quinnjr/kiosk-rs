@@ -1,0 +1,40 @@
+---
+interface Props {
+  /** GitHub URL of the Markdown file this page renders. */
+  editUrl?: string;
+}
+const { editUrl } = Astro.props;
+---
+
+<article
+  class="prose prose-slate max-w-none dark:prose-invert
+         prose-headings:scroll-mt-24 prose-headings:font-semibold
+         prose-h1:text-3xl prose-h1:tracking-tight
+         prose-a:font-medium prose-a:text-accent-700 prose-a:underline prose-a:decoration-accent-400/50 prose-a:underline-offset-2
+         hover:prose-a:decoration-accent-500 dark:prose-a:text-accent-400
+         prose-code:rounded prose-code:bg-slate-100 prose-code:px-1 prose-code:py-0.5
+         prose-code:font-normal prose-code:before:content-none prose-code:after:content-none
+         dark:prose-code:bg-slate-800
+         prose-pre:rounded-lg prose-pre:border prose-pre:border-slate-200 prose-pre:text-sm
+         dark:prose-pre:border-slate-800
+         prose-th:border-b prose-th:border-slate-300 prose-th:px-3 prose-th:py-2 prose-th:text-left
+         dark:prose-th:border-slate-700
+         prose-td:border-b prose-td:border-slate-200 prose-td:px-3 prose-td:py-2
+         dark:prose-td:border-slate-800
+         prose-blockquote:border-l-accent-500 prose-blockquote:font-normal prose-blockquote:not-italic"
+>
+  <slot />
+</article>
+
+{
+  editUrl && (
+    <p class="mt-10 border-t border-slate-200 pt-4 text-sm dark:border-slate-800">
+      <a
+        href={editUrl}
+        class="text-slate-500 underline decoration-slate-300 underline-offset-2 transition hover:text-accent-700 dark:text-slate-400 dark:decoration-slate-600 dark:hover:text-accent-400"
+      >
+        Edit this page on GitHub
+      </a>
+    </p>
+  )
+}

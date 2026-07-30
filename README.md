@@ -101,6 +101,11 @@ See [`docs/manual-test-matrix.md`](docs/manual-test-matrix.md) for the hardware
 test procedure and the full list of known limitations, and
 [`docs/superpowers/specs/`](docs/superpowers/specs/) for the design rationale.
 
+Those files are also published as a site at
+[quinnjr.github.io/kiosk-rs](https://quinnjr.github.io/kiosk-rs/), which renders this
+README and the two documents above directly — there is no second copy to keep in
+sync. To work on it: `cd docs && pnpm install && pnpm dev`.
+
 ## Testing
 
 ```sh

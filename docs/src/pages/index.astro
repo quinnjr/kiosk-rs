@@ -1,0 +1,44 @@
+---
+import { getEntry, render } from 'astro:content';
+import Base from '../layouts/Base.astro';
+import Prose from '../components/Prose.astro';
+import { nav, HOME_ID, sourceUrl } from '../nav';
+
+// The landing page *is* the README, rendered in place. Writing a separate
+// welcome page would mean maintaining the same quick-start twice.
+const entry = await getEntry('docs', HOME_ID);
+if (!entry) throw new Error('README.md not found — check the glob base in content.config.ts');
+const { Content } = await render(entry);
+
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const others = nav.filter((page) => page.id !== HOME_ID);
+---
+
+<Base title="kiosk-rs — a minimal Wayland kiosk compositor" current={HOME_ID}>
+  <Prose editUrl={sourceUrl(HOME_ID)}>
+    <Content />
+  </Prose>
+
+  <section class="mt-14 border-t border-slate-200 pt-8 dark:border-slate-800">
+    <h2 class="text-sm font-semibold tracking-wider text-slate-500 uppercase">
+      Also in these docs
+    </h2>
+    <div class="mt-4 grid gap-4 sm:grid-cols-2">
+      {
+        others.map((entry) => (
+          <a
+            href={`${base}/${entry.slug}`}
+            class="group rounded-lg border border-slate-200 p-4 transition hover:border-accent-500 hover:bg-accent-50/40 dark:border-slate-800 dark:hover:border-accent-600 dark:hover:bg-slate-900"
+          >
+            <p class="font-medium text-slate-900 group-hover:text-accent-700 dark:text-white dark:group-hover:text-accent-400">
+              {entry.label}
+            </p>
+            <p class="mt-1 text-sm text-slate-600 dark:text-slate-400">
+              {entry.blurb}
+            </p>
+          </a>
+        ))
+      }
+    </div>
+  </section>
+</Base>
