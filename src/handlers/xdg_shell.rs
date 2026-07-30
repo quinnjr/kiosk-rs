@@ -11,9 +11,13 @@
 //! - An empty stack does *not* exit. The compositor's lifetime is the child
 //!   process's, so there is exactly one shutdown trigger.
 //! - Popups are honoured, with the positioner constrained to the output.
+//! - At most 32 toplevels are tracked; a client that exceeds the cap is sent a
+//!   protocol error and disconnected.
 //!
-//! Rejecting extra toplevels was considered and rejected: a GTK dialog *is* an
-//! `xdg_toplevel`, so rejection breaks ordinary applications.
+//! Rejecting the *second* toplevel was considered and rejected: a GTK dialog *is*
+//! an `xdg_toplevel`, so refusing it breaks ordinary applications. The cap above is
+//! a different policy — it exists only to stop a client exhausting memory, and sits
+//! far above any real dialog stack.
 
 use smithay::desktop::{
     PopupKeyboardGrab, PopupKind, PopupPointerGrab, PopupUngrabStrategy, Window,
@@ -24,7 +28,6 @@ use smithay::input::pointer::Focus;
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::Resource;
-use smithay::reexports::wayland_server::backend::protocol::ProtocolError;
 use smithay::reexports::wayland_server::protocol::{wl_output, wl_seat};
 use smithay::utils::Serial;
 use smithay::wayland::shell::xdg::decoration::XdgDecorationHandler;
@@ -33,11 +36,10 @@ use smithay::wayland::shell::xdg::{
 };
 use smithay::{delegate_xdg_decoration, delegate_xdg_shell};
 
-/// `wl_display.error` code for "the server is out of resources".
-const WL_DISPLAY_ERROR_NO_MEMORY: u32 = 2;
-
-/// `wl_display` is always object id 1.
-const WL_DISPLAY_OBJECT_ID: u32 = 1;
+/// `wl_surface.error` code 2. See the note at the use site: the protocol has no
+/// resource-limit code reachable from a `wl_surface`, so this is the delivery
+/// vehicle and the message string carries the reason.
+const WL_SURFACE_ERROR_INVALID_SIZE: u32 = 2;
 
 /// Cap on simultaneously-tracked toplevels.
 ///
@@ -62,23 +64,24 @@ impl XdgShellHandler for Kiosk {
                 limit = MAX_TOPLEVELS,
                 "client exceeded the toplevel limit; disconnecting it"
             );
-            // `no_memory` is the protocol's "the server is out of resources"; no
-            // xdg_wm_base code means "resource limit". It must be raised against
-            // `wl_display` itself, because an error code is interpreted against the
-            // *referenced object's* interface — posting 2 on the `wl_surface` would
-            // reach the client as `wl_surface.invalid_size` and send it hunting for
-            // a size bug. Killing the client is the point; the compositor lives on.
-            if let Some(client) = surface.wl_surface().client() {
-                client.kill(
-                    &self.display_handle,
-                    ProtocolError {
-                        code: WL_DISPLAY_ERROR_NO_MEMORY,
-                        object_id: WL_DISPLAY_OBJECT_ID,
-                        object_interface: "wl_display".to_string(),
-                        message: format!("too many toplevels (limit {MAX_TOPLEVELS})"),
-                    },
-                );
-            }
+            // `post_error`, not `Client::kill`. `kill` looks like the right API —
+            // "kill this client by triggering a protocol error" — but it only sets a
+            // flag and hands the `ProtocolError` to `ClientData::disconnected`; it
+            // never puts `wl_display.error` on the wire. The client would just see an
+            // unexplained EOF and could not tell a limit violation from a compositor
+            // crash. `post_error` builds the message, flushes, *then* kills.
+            //
+            // The code is imprecise and cannot be otherwise: an error code is
+            // interpreted against the referenced object's interface, the only object
+            // in hand is the `wl_surface`, and no protocol code on any object we hold
+            // means "resource limit" (`no_memory` lives on `wl_display`, which
+            // wayland-server does not expose as a `Resource`). The message string
+            // carries the real reason; a delivered-but-mislabelled error is strictly
+            // better for the client than a silent disconnect.
+            surface.wl_surface().post_error(
+                WL_SURFACE_ERROR_INVALID_SIZE,
+                format!("too many toplevels (limit {MAX_TOPLEVELS})"),
+            );
             return;
         }
 

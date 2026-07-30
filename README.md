@@ -60,8 +60,13 @@ can make a startup failure silent.
 
 Once the TTY is in graphics mode, stderr goes to a console nobody can see, so
 `--log-file` is what makes verbose logging useful on the real target. It appends,
-so a crash-looping kiosk keeps the history of every attempt. The application keeps
-stdout and stderr, so its own logging is not swallowed.
+so a crash-looping kiosk keeps the history of every attempt.
+
+The application keeps its own stdout and stderr **only when you have redirected
+them** to a file or pipe. A stream that is still a console is replaced with
+`/dev/null`, because an inherited console descriptor lets a compromised client
+switch VTs and escape the kiosk — and the console is unreadable under graphics mode
+anyway. So redirect if you want the application's logging: `kiosk -- app > app.log 2>&1`.
 
 ## Scope
 

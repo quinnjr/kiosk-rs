@@ -57,8 +57,10 @@ pub struct Kiosk {
 
     // Input.
     pub seat: Seat<Self>,
-    /// `None` until a pointer device appears; the cursor is only drawn when a
-    /// pointer exists.
+    /// `Some` only if a pointer device existed at startup — capabilities are fixed
+    /// for the session (see the test matrix's *Fixed input capabilities*), so a
+    /// pointer plugged in later does not populate this. The cursor is drawn only
+    /// when this is `Some`.
     pub pointer: Option<PointerHandle<Self>>,
     pub cursor_status: CursorImageStatus,
     pub pointer_location: Point<f64, Logical>,
@@ -66,8 +68,9 @@ pub struct Kiosk {
     /// Keys the client currently believes are held. Needed because the release of
     /// a `Ctrl+Alt+F<n>` chord is delivered to the incoming VT, not to us.
     pub pressed_keys: HashSet<Keycode>,
-    /// The most recent libinput event timestamp, in libinput's timebase.
-    /// Synthetic key releases reuse it so they are never stamped in the past.
+    /// The most recent *keyboard* event timestamp, in libinput's timebase. Pointer
+    /// and touch events do not update it — only key events need it, so that a
+    /// synthetic release is never stamped earlier than the press it releases.
     pub last_input_time: u32,
 
     // Shell.

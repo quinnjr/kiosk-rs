@@ -44,7 +44,7 @@ grabs the keyboard and misbehaves leaves no way out but SSH or a power cycle.
 | 12 | `kiosk --output <a disconnected name> -- foot; echo $?` | Exits `1` mentioning `disconnected`. Does **not** fall back to a connected output. | Disconnected branch, no silent fallback |
 | 13 | `kiosk --list-outputs` over SSH, no VT needed | Prints every connector with state and preferred mode; exits `0`. | Pre-EGL discovery |
 | 14 | `kiosk --log-file /nonexistent-dir/x.log -- foot; echo $?` | Exits `1` with a visible message while stderr still works. | Log destination failure before graphics mode |
-| 15 | `kiosk -vvv --log-file /tmp/k.log -- foot`, then inspect the file | Contains Smithay protocol-level spans and DRM commit detail. Terminal output is the client's only. | Verbosity mapping, stream separation |
+| 15 | `kiosk -vvv --log-file /tmp/k.log -- foot`, then inspect the file | The file holds kiosk's logs. The terminal stays silent — on a console the child's stdout/stderr are replaced with `/dev/null` (see case 24), so the client prints nothing there either. | Verbosity mapping, stream separation |
 | 16 | `RUST_LOG=kiosk=warn kiosk -vvv -- foot` | Only warnings from us, despite `-vvv`. Note the target is `kiosk`, the crate name — `kiosk_rs` matches nothing. | `RUST_LOG` precedence |
 | 17 | `kiosk -- foot` on a machine with two connected outputs | Only the first connected output lights up; the other stays blank. | Single-output policy |
 | 18 | `kiosk -- /nonexistent-binary; echo $?` | Exits `1` naming the binary, **before** the screen is touched — the console never blanks. | Pre-flight binary check (tier 1 ordering) |

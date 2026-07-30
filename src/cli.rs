@@ -75,18 +75,20 @@ impl Cli {
 /// `--crate-name kiosk` and `module_path!()` — hence every event target — is
 /// `kiosk`. Filtering on `kiosk_rs` matches nothing, which silently reduces every
 /// directive below to its bare global level.
-#[cfg(test)]
 pub const LOG_TARGET: &str = "kiosk";
 
 /// The `EnvFilter` directive implied by a `-v` count.
 ///
 /// `RUST_LOG` takes precedence over this and is handled by the caller.
-pub fn log_filter(verbose: u8) -> &'static str {
+pub fn log_filter(verbose: u8) -> String {
+    // Built from `LOG_TARGET` rather than spelled out, so the target cannot drift
+    // away from the crate name again. A literal here is what caused every directive
+    // to match nothing when the package name and crate name diverged.
     match verbose {
-        0 => "kiosk=info,warn",
-        1 => "kiosk=debug,info",
-        2 => "kiosk=trace,debug",
-        _ => "trace",
+        0 => format!("{LOG_TARGET}=info,warn"),
+        1 => format!("{LOG_TARGET}=debug,info"),
+        2 => format!("{LOG_TARGET}=trace,debug"),
+        _ => "trace".to_string(),
     }
 }
 
@@ -197,10 +199,15 @@ mod tests {
             "log directives target {LOG_TARGET:?} but events are emitted as {crate_root:?}"
         );
         for verbose in 0..=2 {
-            assert!(
-                log_filter(verbose).starts_with(crate_root),
-                "-v{verbose} directive {:?} does not match target {crate_root:?}",
-                log_filter(verbose)
+            // Compare the *parsed* target, not a prefix: `"kiosk_rs=info"` starts
+            // with `"kiosk"`, so a prefix check passes on the exact regression this
+            // test exists to catch.
+            let directive = log_filter(verbose);
+            let target = directive.split('=').next().unwrap();
+            assert_eq!(
+                target, crate_root,
+                "-v{verbose} directive {directive:?} targets {target:?}, but events \
+                 are emitted as {crate_root:?}"
             );
         }
     }
