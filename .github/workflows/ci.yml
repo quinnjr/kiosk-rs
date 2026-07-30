@@ -70,40 +70,9 @@ jobs:
       - name: Build release
         run: cargo build --release --locked
 
-      # Prebuilt, like cargo-llvm-cov: building these from source on every run
-      # costs minutes and is not covered by the target cache.
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-deb,cargo-generate-rpm
-
-      # --no-build: reuse the release binary from the step above rather than
-      # compiling it a second time.
-      - name: Build .deb and .rpm
-        run: |
-          cargo deb --no-build
-          cargo generate-rpm
-
-      # cargo-deb resolves `$auto` with dpkg-shlibdeps, and when that binary is
-      # missing it prints a *warning* and emits a package whose Depends field has
-      # silently lost every library. That is worse than a hard failure: the deb
-      # looks fine and installs onto a system with none of its libraries. So
-      # assert the field actually contains what the binary links against.
-      #
-      # The .rpm needs no equivalent check: its requires are written out
-      # explicitly in Cargo.toml rather than discovered, so there is nothing that
-      # can silently come back empty.
-      - name: Verify .deb dependencies were resolved
-        run: |
-          deb=$(find target/debian -name '*.deb' -print -quit)
-          echo "inspecting $deb"
-          depends=$(dpkg-deb --field "$deb" Depends)
-          echo "Depends: $depends"
-          for lib in libgbm1 libseat1 libinput10 libxkbcommon0 libegl1; do
-            case "$depends" in
-              *"$lib"*) echo "  ok   $lib" ;;
-              *) echo "  MISSING $lib -- \$auto did not resolve"; exit 1 ;;
-            esac
-          done
+      # Shared with the release workflow so the two cannot drift -- notably the
+      # dependency guard, which exists because cargo-deb fails open.
+      - uses: ./.github/actions/build-packages
 
       - uses: actions/upload-artifact@v4
         with:
