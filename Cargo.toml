@@ -8,6 +8,19 @@ license = "MIT"
 repository = "https://github.com/quinnjr/kiosk-rs"
 keywords = ["wayland", "compositor", "kiosk", "smithay"]
 categories = ["gui"]
+# The documentation *site* is build tooling for GitHub Pages, not part of the
+# crate -- shipping an Astro config and a 120K pnpm lockfile to anyone running
+# `cargo install` is pure noise. The two prose documents under docs/ are kept,
+# since the README links to both and they are the real reference material.
+exclude = [
+    "docs/package.json",
+    "docs/pnpm-lock.yaml",
+    "docs/pnpm-workspace.yaml",
+    "docs/astro.config.mjs",
+    "docs/.gitignore",
+    "docs/src/**",
+    "docs/public/**",
+]
 
 [[bin]]
 name = "kiosk"
