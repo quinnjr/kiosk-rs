@@ -11,7 +11,10 @@ const BASE = '/kiosk-rs';
 export default defineConfig({
   site: 'https://quinnjr.github.io',
   base: BASE,
-  trailingSlash: 'ignore',
+  // 'always', matching how GitHub Pages actually serves directory output: it
+  // 301s /testing to /testing/, so slashless internal links would take a
+  // redirect hop on every navigation.
+  trailingSlash: 'always',
   // The source Markdown links between files by repo-relative path, which is
   // correct on GitHub and would 404 here. Redirect those paths to the pages that
   // render them, rather than forking the files or rewriting them at build time
@@ -21,9 +24,9 @@ export default defineConfig({
   // would land on the domain root instead of the project site.
   redirects: {
     '/README.md': `${BASE}/`,
-    '/docs/manual-test-matrix.md': `${BASE}/testing`,
-    '/docs/superpowers/specs': `${BASE}/design`,
-    '/docs/superpowers/specs/2026-07-29-kiosk-rs-design.md': `${BASE}/design`,
+    '/docs/manual-test-matrix.md': `${BASE}/testing/`,
+    '/docs/superpowers/specs': `${BASE}/design/`,
+    '/docs/superpowers/specs/2026-07-29-kiosk-rs-design.md': `${BASE}/design/`,
   },
   markdown: {
     shikiConfig: {

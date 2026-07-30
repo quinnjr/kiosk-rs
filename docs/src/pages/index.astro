@@ -27,7 +27,7 @@ const others = nav.filter((page) => page.id !== HOME_ID);
       {
         others.map((entry) => (
           <a
-            href={`${base}/${entry.slug}`}
+            href={`${base}/${entry.slug}/`}
             class="group rounded-lg border border-slate-200 p-4 transition hover:border-accent-500 hover:bg-accent-50/40 dark:border-slate-800 dark:hover:border-accent-600 dark:hover:bg-slate-900"
           >
             <p class="font-medium text-slate-900 group-hover:text-accent-700 dark:text-white dark:group-hover:text-accent-400">
