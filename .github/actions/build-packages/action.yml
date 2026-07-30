@@ -1,0 +1,66 @@
+name: Build distro packages
+description: >-
+  Build the .deb and .rpm from an already-compiled release binary, and assert the
+  deb's dependencies actually resolved.
+
+# A composite action rather than a reusable workflow, deliberately: this runs
+# inside a job that has already produced target/release/kiosk, so both callers
+# reuse that binary instead of compiling it a second time. It exists at all
+# because CI and the release flow both package, and a copy-pasted second version
+# of the dependency guard below would be the first thing to drift.
+
+outputs:
+  deb:
+    description: Path to the built .deb
+    value: ${{ steps.paths.outputs.deb }}
+  rpm:
+    description: Path to the built .rpm
+    value: ${{ steps.paths.outputs.rpm }}
+
+runs:
+  using: composite
+  steps:
+    # Prebuilt: compiling these from source on every run costs minutes and is
+    # not covered by the target cache.
+    - uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-deb,cargo-generate-rpm
+
+    # --no-build: reuse the release binary the caller already built.
+    - name: Build .deb and .rpm
+      shell: bash
+      run: |
+        cargo deb --no-build
+        cargo generate-rpm
+
+    # cargo-deb resolves `$auto` with dpkg-shlibdeps, and when that binary is
+    # missing it prints a *warning* and emits a package whose Depends field has
+    # silently lost every library. That is worse than a hard failure: the deb
+    # looks fine and installs onto a system with none of its libraries. So
+    # assert the field actually contains what the binary links against.
+    #
+    # The .rpm needs no equivalent check: its requires are written out
+    # explicitly in Cargo.toml rather than discovered, so there is nothing that
+    # can silently come back empty.
+    - name: Verify .deb dependencies were resolved
+      shell: bash
+      run: |
+        deb=$(find target/debian -name '*.deb' -print -quit)
+        echo "inspecting $deb"
+        depends=$(dpkg-deb --field "$deb" Depends)
+        echo "Depends: $depends"
+        for lib in libgbm1 libseat1 libinput10 libxkbcommon0 libegl1; do
+          case "$depends" in
+            *"$lib"*) echo "  ok   $lib" ;;
+            *) echo "  MISSING $lib -- \$auto did not resolve"; exit 1 ;;
+          esac
+        done
+
+    - name: Record artifact paths
+      id: paths
+      shell: bash
+      run: |
+        {
+          echo "deb=$(find target/debian -name '*.deb' -print -quit)"
+          echo "rpm=$(find target/generate-rpm -name '*.rpm' -print -quit)"
+        } >> "$GITHUB_OUTPUT"

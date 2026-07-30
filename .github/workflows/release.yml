@@ -1,0 +1,140 @@
+name: Release
+
+# Tag-triggered, matching the git-flow model this repo uses:
+#
+#   feature/*  ->  develop            ordinary work
+#   release/*  ->  develop + main     stabilise, then `git flow release finish`
+#                                     merges to main and tags vX.Y.Z there
+#   hotfix/*   ->  main + develop     same, from main
+#
+# So a `vX.Y.Z` tag is the signal that `git flow release finish` (or
+# `hotfix finish`) has run and main holds the released tree. This builds the
+# packages from that exact tag and publishes them.
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  # Lets a failed publish be retried against an existing tag without moving it.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vX.Y.Z tag to (re)publish
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      # Job-level so the crates.io step's `if` can see it. A step's own `env`
+      # block is not in scope for that step's `if`, so testing the secret there
+      # silently never matches. Only the boolean is hoisted; the token itself
+      # stays scoped to the one step that needs it.
+      HAS_CRATES_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          # Full history: the git-flow guard below needs to know whether the tag
+          # is an ancestor of main, which a shallow clone cannot answer.
+          fetch-depth: 0
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          echo "name=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      # git flow tags releases on main. A tag somewhere else means the release
+      # branch was never finished, so the tree being published is not the tree
+      # main says is released -- fail rather than ship it.
+      - name: Check the tag is on main
+        run: |
+          git fetch --quiet origin main:refs/remotes/origin/main
+          if git merge-base --is-ancestor "${{ steps.tag.outputs.name }}" origin/main; then
+            echo "ok: ${{ steps.tag.outputs.name }} is an ancestor of main"
+          else
+            echo "::error::${{ steps.tag.outputs.name }} is not reachable from main."
+            echo "::error::git flow tags releases on main; run 'git flow release finish' first."
+            exit 1
+          fi
+
+      # The version in Cargo.toml has to agree with the tag, or the artifacts get
+      # filenames from one and contents from the other.
+      - name: Check Cargo.toml version matches the tag
+        run: |
+          manifest=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "$manifest" != "${{ steps.tag.outputs.version }}" ]; then
+            echo "::error::Cargo.toml is $manifest but the tag says ${{ steps.tag.outputs.version }}"
+            exit 1
+          fi
+          echo "ok: both are $manifest"
+
+      # Same list as the CI job, plus dpkg-dev for dpkg-shlibdeps -- without it
+      # cargo-deb emits a package with no library dependencies and only warns.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libinput-dev libseat-dev libgbm-dev libegl1-mesa-dev \
+            libudev-dev libxkbcommon-dev libwayland-dev libdrm-dev \
+            dpkg-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Tests run here too. CI already ran them on the branch, but a tag can
+      # point anywhere, and publishing is the one step that cannot be undone.
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - uses: ./.github/actions/build-packages
+        id: packages
+
+      # Notes come from the annotated tag's own message, so the release text and
+      # the tag cannot disagree. --verify-tag refuses to invent a tag that is not
+      # already pushed.
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.tag.outputs.name }}"
+          git tag -l --format='%(contents)' "$tag" > notes.md
+          if [ ! -s notes.md ]; then
+            echo "Release $tag" > notes.md
+          fi
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release exists; replacing its assets"
+            gh release upload "$tag" \
+              "${{ steps.packages.outputs.deb }}" \
+              "${{ steps.packages.outputs.rpm }}" --clobber
+          else
+            gh release create "$tag" \
+              --title "$tag" \
+              --verify-tag \
+              --notes-file notes.md \
+              "${{ steps.packages.outputs.deb }}" \
+              "${{ steps.packages.outputs.rpm }}"
+          fi
+
+      # Opt-in: only runs if a CARGO_REGISTRY_TOKEN secret exists. Without one
+      # the step is skipped rather than failing the release, because the GitHub
+      # half is already done and publishing to crates.io by hand is one command.
+      - name: Publish to crates.io
+        if: env.HAS_CRATES_TOKEN == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked

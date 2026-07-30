@@ -129,6 +129,34 @@ Those files are also published as a site at
 README and the two documents above directly — there is no second copy to keep in
 sync. To work on it: `cd docs && pnpm install && pnpm dev`.
 
+## Releasing
+
+The repository follows git flow: `feature/*` and `bugfix/*` branch off `develop`,
+`release/*` stabilises a version, and `hotfix/*` branches off `main`. `main` holds
+the released tree and is where versions are tagged.
+
+```sh
+git flow release start 0.2.0
+# bump `version` in Cargo.toml, commit, let CI go green on the branch
+git flow release finish 0.2.0     # merges to main + develop, tags v0.2.0
+git push origin main develop --tags
+```
+
+Pushing the tag is the trigger. `.github/workflows/release.yml` then builds the
+`.deb` and `.rpm` from that exact tag and attaches them to a GitHub release whose
+notes are the annotated tag's own message — so the release text cannot drift from
+the tag. Two guards run first and fail the release rather than shipping:
+
+- **the tag must be reachable from `main`**, since a tag anywhere else means
+  `git flow release finish` never ran and the published tree is not the one `main`
+  calls released;
+- **`Cargo.toml`'s version must equal the tag**, or the artifacts get their
+  filenames from one and their contents from the other.
+
+crates.io is published only if a `CARGO_REGISTRY_TOKEN` secret exists; otherwise
+that step is skipped and `cargo publish` is a one-liner locally. `workflow_dispatch`
+re-runs the whole thing against an existing tag without moving it.
+
 ## Testing
 
 ```sh
